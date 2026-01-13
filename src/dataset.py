@@ -23,6 +23,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from transformers import WhisperProcessor
 import math
 import torchaudio
+import soundfile as sf # Added for reliable audio loading without torchcodec dependencyn
 
 DBG=True if len(sys.argv) == 1 else False
 
@@ -195,7 +196,15 @@ class mms_llama_dataset(FairseqDataset):
         self.snr_target = snr_target
         self.snr_levels = [-5, 0, 5, 10, 15, 20]
 
-        self.noise, sample_rate = torchaudio.load(noise_fn)
+        # Use soundfile instead of torchaudio.load to avoid torchcodec backend issues
+        noise_audio, sample_rate = sf.read(noise_fn, dtype='float32')
+        # Ensure (Channels, Time) format
+        if noise_audio.ndim == 1:
+            noise_audio = noise_audio[np.newaxis, :]  # (1, T)
+        else:
+            noise_audio = noise_audio.T  # (C, T)
+        self.noise = torch.from_numpy(noise_audio)
+        
         self.noise_prob = noise_prob
         
         assert sample_rate == 16000
@@ -282,6 +291,14 @@ class mms_llama_dataset(FairseqDataset):
             sample_rate, wav_data = wavfile.read(audio_fn)
             assert sample_rate == 16_000 and len(wav_data.shape) == 1
             
+
+            # --- FIX: Normalize Int16 audio to Float32 [-1, 1] ---
+            if wav_data.dtype == np.int16:
+                wav_data = wav_data / 32768.0
+            
+            wav_data = wav_data.astype(np.float32)
+            # -----------------------------------------------------
+
             if self.subset == 'train' and np.random.rand() < self.noise_prob:
                 wav_data = self.add_noise(wav_data)
             elif self.subset =='test' and self.snr_target is not None:
@@ -312,7 +329,7 @@ class mms_llama_dataset(FairseqDataset):
         labels = [torch.cat((labels[0], torch.tensor([self.llm_tokenizer.eos_token_id]).long()))]
      
         fid = self.names[index][1].split(':')[1]
-        txt_feats = self.llm_tokenizer("Recognize this speech in English. Input : ", return_tensors="pt").input_ids[0]
+        txt_feats = self.llm_tokenizer("Recognize this speech in German. Input : ", return_tensors="pt").input_ids[0]
         speech_rate = self.speech_rates[index]
         sr_label = torch.tensor(float(speech_rate), dtype=torch.float32)
         return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, "label_list": labels, 'text_source':[txt_feats], 'sr_label': sr_label}
@@ -514,6 +531,10 @@ class mms_llama_dataset(FairseqDataset):
 
 
     def num_tokens(self, index):
+        # We need to expose the TRUE cost of the item to Fairseq's batcher.
+        # Since pad_audio=True means every item becomes 3000 frames long:
+        if self.pad_audio:
+            return self.max_sample_size # e.g. 3000
         return self.size(index)
 
     def size(self, index):

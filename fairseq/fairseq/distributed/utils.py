@@ -766,7 +766,10 @@ def _broadcast_object_slow(
         buffer = torch.ByteTensor(int(length.item())).to(dist_device)
         broadcast(buffer, src=src_rank, group=group)
         buffer = io.BytesIO(buffer.cpu().numpy())
-        obj = torch.load(buffer, map_location="cpu")
+        try:
+            obj = torch.load(buffer, map_location="cpu", weights_only=False)
+        except TypeError:
+            obj = torch.load(buffer, map_location="cpu")
     return obj
 
 

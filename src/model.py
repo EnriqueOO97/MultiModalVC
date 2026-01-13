@@ -377,10 +377,15 @@ class MMS_LLaMA(BaseFairseqModel):
         # --------------------------------------
 
         whisper_enc_out = self.whisper(kwargs['source'])
+        # print(f"DEBUG: Whisper feat. extraction shape: {whisper_enc_out.shape}")
+        # print(f"DEBUG: Whisper feat. extraction shape: {whisper_enc_out}")
         avhubert_source = {'audio': None, 'video': kwargs['source']['video']}
         avhubert_output = self.avhubert(source=avhubert_source, padding_mask=kwargs['padding_mask'])
         # AVHubert encoder output: (T x B x D) -> (B x T x D)
         avhubert_output['encoder_out'] = avhubert_output['encoder_out'].transpose(0, 1)
+        # avhubert_output['encoder_out'] = torch.zeros_like(avhubert_output['encoder_out'])
+        # print(f"DEBUG: AVHubert GENERATE encoder_out shape: {avhubert_output['encoder_out'].shape}")
+        # print(f"DEBUG: AVHubert GENERATE content {avhubert_output['encoder_out']}")
 
         video_lengths = torch.sum(~avhubert_output['padding_mask'], dim=1).tolist()
         max_vid_len = max(video_lengths)
@@ -395,6 +400,9 @@ class MMS_LLaMA(BaseFairseqModel):
         # --------------------------------------
 
         whisper_enc_out = self.afeat_1d_conv(whisper_enc_out.transpose(1, 2)).transpose(1, 2)
+        #whisper_enc_out=torch.zeros_like(whisper_enc_out)
+        # print(f"DEBUG: Whisper Encoder out GENERATE shape: {whisper_enc_out.shape}")
+        # print(f"DEBUG: Whisper Encoder out GENERATE shape: {whisper_enc_out}")
 
         # --------------------------------------
         # 3. AVHubert Feature & Padding Mask Preparation
@@ -409,15 +417,21 @@ class MMS_LLaMA(BaseFairseqModel):
             avhubert_output['encoder_out'] = self.vfeat_1d_conv(
                 avhubert_output['encoder_out'].transpose(1, 2)
             ).transpose(1, 2)
+            # print(f"DEBUG: AVHubert ELSE content {avhubert_output['encoder_out']}")
 
         # --------------------------------------
         # 4. Temporal Alignment & Modality Fusion
         # --------------------------------------
         B, T_v, _ = avhubert_output['encoder_out'].size()
         whisper_enc_out = whisper_enc_out[:, :T_v, :]
+        # print(f"DEBUG: Whisper alignment out GENERATE shape: {whisper_enc_out.shape}")
+        # print(f"DEBUG: Whisper alignment out GENERATE shape: {whisper_enc_out}")
+
 
         if self.modality_fuse == 'concat':
             av_feat = torch.cat([whisper_enc_out, avhubert_output['encoder_out']], dim=2)
+            # print(f"DEBUG: FUSION CONCAT content {av_feat.shape}")
+            # print(f"DEBUG: FUSION CONCAT content {av_feat}")
         elif self.modality_fuse == 'add':
             av_feat = whisper_enc_out + avhubert_output['encoder_out']
         elif self.modality_fuse == 'cross-att':
@@ -434,7 +448,10 @@ class MMS_LLaMA(BaseFairseqModel):
         instructions = kwargs['source']['instruction']  # List[torch.Tensor], B
 
         if self.cfg.use_qformer:
+            # print("DEBUG: USING QFORMER IN GENERATE")
             query_output = self.compression_using_qformer(len_queries, resized_len_list, len_feat, av_feat)
+            # print(f"DEBUG: QFORMER output shape {query_output.shape}")
+            # print(f"DEBUG: QFORMER output content {query_output}")
             query_output = self.avfeat_to_llm(query_output)
             llm_inputs, attention_mask, _ = self.prepare_inputs_labels_for_queries(
                 instructions, query_output, len_queries
@@ -450,6 +467,9 @@ class MMS_LLaMA(BaseFairseqModel):
         # 6. LLM Generation
         # --------------------------------------
         self.llama.generation_config.pad_token_id = self.tokenizer("<|finetune_right_pad_id|>").input_ids[1]
+
+        #print("DEBUG before going into the model--------------------------------------------------")
+        #print(f"These are the LLm inputs that go into the model for generation: {llm_inputs.shape}")
 
         outputs = self.llama.generate(
             inputs_embeds=llm_inputs,
@@ -474,12 +494,28 @@ class MMS_LLaMA(BaseFairseqModel):
             query = queries[i][:len_query, :]
 
             inst_emb = self.llama.model.embed_tokens(instruction.unsqueeze(0)).squeeze(0)
+
+            # ================= DEBUG PROBE START =================
+            #if i == 0: # Only print for the first item in batch to avoid spam
+            #    print(f"\n[DEBUG PROBE] Step 1: Instruction Tokens Shape: {instruction.shape}")
+            #    print(f"[DEBUG PROBE] Step 2: Instruction Embedding Shape: {inst_emb.shape}")
+            #    print(f"[DEBUG PROBE] Step 3: Audio/Video Query Shape: {query.shape}")
+            # ================= DEBUG PROBE END ===================
+
+
             if labels is not None:
                 label = labels[i]
                 label_emb = self.llama.model.embed_tokens(label.unsqueeze(0)).squeeze(0)
                 combined = torch.cat([inst_emb, query, label_emb], dim=0)
             else:
                 combined = torch.cat([inst_emb, query], dim=0)
+                #combined = torch.cat([query], dim=0)
+
+            # ================= DEBUG PROBE START =================
+            #if i == 0:
+            #    print(f"[DEBUG PROBE] Step 4: FINAL Combined Input Shape: {combined.shape}")
+            #    print(f"[DEBUG PROBE] Logic Check: {inst_emb.shape[0]} (Text) + {query.shape[0]} (Audio) = {combined.shape[0]} (Total)?\n")
+            # ================= DEBUG PROBE END ===================
 
             llm_input_list.append(combined)
             lengths.append(combined.size(0)) 

@@ -223,7 +223,19 @@ def _main(cfg, output_file):
             instruction = tokenizer.decode(sample['net_input']['source']['instruction'][i].int().cpu(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
             result_dict['instruction'].append(instruction)
             result_dict['hypo'].append(hypo_str)
-            logger.info(f"\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}\n")
+            
+            # Retrieve file path from dataset using sample ID
+            sample_id = sample['id'][i].item()
+            try:
+                # Access the dataset object to get the file path
+                # task.dataset(subset) returns the dataset object
+                dataset_obj = task.dataset(cfg.dataset.gen_subset)
+                # The 'names' attribute contains the paths (video_fn:audio_fn)
+                file_path_info = dataset_obj.names[sample_id]
+            except Exception as e:
+                file_path_info = f"Unknown (Error: {e})"
+
+            logger.info(f"\nFILE:{file_path_info}\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}\n")
             num_sentences += 1
 
     logger.info("Num_sentences {:,}".format(
