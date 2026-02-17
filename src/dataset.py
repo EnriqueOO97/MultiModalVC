@@ -305,14 +305,16 @@ class mms_llama_dataset(FairseqDataset):
                 if self.noise_prob != 0:
                     wav_data = self.add_noise(wav_data)
                 
+            audio_len_samples = int(len(wav_data))
             len_audio_feats = math.floor(len(wav_data)/16000*100)
             audio_feats = self.whisper_processor(wav_data, sampling_rate=sample_rate, return_tensors="pt").input_features #[:,:,:len_audio_feats]
                        
         else:
             audio_feats = None
+            audio_len_samples = None
             
         
-        return video_feats, audio_feats
+        return video_feats, audio_feats, audio_len_samples
 
     def load_video(self, audio_name):
         feats = custom_utils.load_video(os.path.join(self.audio_root, audio_name))
@@ -322,17 +324,39 @@ class mms_llama_dataset(FairseqDataset):
 
 
     def __getitem__(self, index):
-        video_feats, audio_feats = self.load_feature(self.names[index])
+        video_feats, audio_feats, audio_len_samples = self.load_feature(self.names[index])
         video_feats = torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
 
         labels = [self.llm_tokenizer(self.label_list[0][index], return_tensors="pt").input_ids[0]]
         labels = [torch.cat((labels[0], torch.tensor([self.llm_tokenizer.eos_token_id]).long()))]
      
         fid = self.names[index][1].split(':')[1]
-        txt_feats = self.llm_tokenizer("Recognize this speech in German. Input : ", return_tensors="pt").input_ids[0]
+        
+        # Modified for Speech Generation Task: constant instruction
+        txt_feats = self.llm_tokenizer("Focus on semantics, not voice characteristics", return_tensors="pt").input_ids[0]
+        
         speech_rate = self.speech_rates[index]
         sr_label = torch.tensor(float(speech_rate), dtype=torch.float32)
-        return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, "label_list": labels, 'text_source':[txt_feats], 'sr_label': sr_label}
+
+        # Lazy load mel spectrogram targets if they exist
+        # self.names[index] = (video_path, audio_path:audio_id)
+        # audio_path:audio_id -> split(':')[0] = actual audio path
+        audio_path = self.names[index][1].split(':')[0]  # e.g., /path/to/00090_00.wav
+        mel_path = os.path.splitext(audio_path)[0] + "_mel_100hz_128bands.pt"  # e.g., /path/to/00090_00_mel.pt
+        target_mel = None
+        
+        if os.path.exists(mel_path):
+            try:
+                target_mel = torch.load(mel_path)
+                # DEBUG: Print mel shape for first few samples
+                if index < 5:
+                    print(f"[DATASET DEBUG] index={index}, mel_path={mel_path.split('/')[-1]}, mel_shape={target_mel.shape}")
+            except Exception as e:
+                logger.warning(f"Failed to load mel target at {mel_path}: {e}")
+
+        return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, 
+                "audio_len_samples": audio_len_samples, "label_list": labels, 'text_source':[txt_feats], 
+                'sr_label': sr_label, 'target_mel': target_mel}
 
     def __len__(self):
         return len(self.sizes)
@@ -358,8 +382,15 @@ class mms_llama_dataset(FairseqDataset):
             return {}
 
         audio_source, video_source = [s["audio_source"] for s in samples], [s["video_source"] for s in samples]
+        audio_len_samples = [s["audio_len_samples"] for s in samples]
+        
+        # DEBUG: Show per-sample audio lengths BEFORE they become tensor
+        # if audio_len_samples and audio_len_samples[0] is not None:
+        #     print(f"[COLLATER DEBUG] audio_len_samples: {audio_len_samples[:10]}... unique={len(set(audio_len_samples))}")
+        
         if audio_source[0] is None:
             audio_source = None
+            audio_len_samples = None
         if video_source[0] is None:
             video_source = None
             
@@ -392,10 +423,35 @@ class mms_llama_dataset(FairseqDataset):
             for i in range(self.num_labels)
         ]
         
+        # Handle Mel Targets
+        target_mels = [s.get("target_mel") for s in samples]
+        collated_target_mels = None
+        mel_lengths = None
+        
+        if target_mels[0] is not None:
+            # target_mels are tensors (T, 80). We need to pad them to the max length in batch.
+            # Also store actual per-sample lengths for proper masking in criterion.
+            
+            # Get actual lengths BEFORE padding 
+            mel_lengths = torch.tensor([m.size(0) for m in target_mels], dtype=torch.long)
+            
+            # DEBUG: Print actual per-sample lengths BEFORE padding
+           # print(f"[COLLATER DEBUG] mel_lengths BEFORE padding: {mel_lengths[:10].tolist()}... unique={len(set(mel_lengths.tolist()))}")
+            
+            # Find max T
+            max_mel_len = mel_lengths.max().item()
+            feature_dim = target_mels[0].size(1)
+            collated_target_mels = target_mels[0].new_zeros(len(target_mels), max_mel_len, feature_dim)
+            
+            for i, mel in enumerate(target_mels):
+                 collated_target_mels[i, :mel.size(0), :] = mel
+
         source = {"audio": collated_audios,
                   "video": collated_videos,
                   "instruction": text_instructions[0],
         }
+        if audio_len_samples is not None:
+            source["audio_lengths"] = torch.tensor(audio_len_samples, dtype=torch.long)
         
         net_input = {"source": source, "padding_mask": padding_mask}
         batch = {
@@ -406,6 +462,10 @@ class mms_llama_dataset(FairseqDataset):
         
         batch['target'] = targets_by_label[0]
         batch['sr_labels'] = sr_labels
+        
+        if collated_target_mels is not None:
+            batch['target_mel'] = collated_target_mels
+            batch['mel_lengths'] = mel_lengths  # Actual per-sample mel lengths for masking
         
         return batch
         
@@ -533,8 +593,8 @@ class mms_llama_dataset(FairseqDataset):
     def num_tokens(self, index):
         # We need to expose the TRUE cost of the item to Fairseq's batcher.
         # Since pad_audio=True means every item becomes 3000 frames long:
-        if self.pad_audio:
-            return self.max_sample_size # e.g. 3000
+        # if self.pad_audio:
+        #     return self.max_sample_size # e.g. 3000
         return self.size(index)
 
     def size(self, index):

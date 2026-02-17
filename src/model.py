@@ -181,7 +181,11 @@ class MMS_LLaMA(BaseFairseqModel):
             "feature_grad_mult": cfg.feature_grad_mult,
         }
         root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        w2v_path = f'{root_dir}/pretrained_models/avhubert/large_vox_iter5.pt'
+        
+        if hasattr(cfg, 'w2v_path') and cfg.w2v_path is not None and cfg.w2v_path != '???':
+            w2v_path = cfg.w2v_path
+        else:
+            w2v_path = f'{root_dir}/pretrained_models/avhubert/large_vox_iter5.pt'
 
         if cfg.w2v_args is None:
             state = checkpoint_utils.load_checkpoint_to_cpu(
@@ -221,7 +225,7 @@ class MMS_LLaMA(BaseFairseqModel):
 
         avhubert.w2v_model.remove_pretraining_modules()
 
-        whisper_ = WhisperForConditionalGeneration.from_pretrained("openai/whisper-medium.en").model.encoder
+        whisper_ = WhisperForConditionalGeneration.from_pretrained("openai/whisper-medium").model.encoder#--------------------------select your whisper
         whisper = WhisperEncoderWrapper(whisper_)
 
         bnb_config = BitsAndBytesConfig(

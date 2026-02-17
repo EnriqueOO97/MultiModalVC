@@ -79,9 +79,15 @@ def main():
     # --- 1. Load Model ---
     print(f"Loading model from {args.checkpoint_path}...")
     
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_w2v_path = os.path.join(root_dir, "pretrained_models", "avhubert", "large_vox_iter5.pt")
+
     model_overrides = {
         "task": {"llm_path": args.llm_path},
-        "model": {"llm_path": args.llm_path}
+        "model": {
+            "llm_path": args.llm_path,
+            "w2v_path": default_w2v_path,
+        },
     }
     
     if args.sr_predictor_path:

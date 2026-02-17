@@ -13,8 +13,10 @@ LLM_PATH="meta-llama/Llama-3.2-3B"
 # Input files
 # NOTE: These paths are specific to your machine. 
 # For a PR, you might want to leave these empty or point to a sample file included in the repo.
-AUDIO_PATH="/ceph/shared/ALL/datasets/voxceleb2-V2/VoxCeleb2-German/dev/processedVideos/vox2_german/vox2_german_video_seg16s/id01869/8DSA1QWxYjA/00008_00.wav"
-VIDEO_PATH="/ceph/shared/ALL/datasets/voxceleb2-V2/VoxCeleb2-German/dev/processedVideos/vox2_german/vox2_german_video_seg16s/id01869/8DSA1QWxYjA/00008_00.mp4"
+#AUDIO_PATH="/ceph/shared/ALL/datasets/voxceleb2-V2/VoxCeleb2-German/dev/processedVideos/vox2_german/vox2_german_video_seg16s/id01869/8DSA1QWxYjA/00008_00.wav"
+#VIDEO_PATH="/ceph/shared/ALL/datasets/voxceleb2-V2/VoxCeleb2-German/dev/processedVideos/vox2_german/vox2_german_video_seg16s/id01869/8DSA1QWxYjA/00008_00.mp4"
+AUDIO_PATH="/ceph/shared/ALL/datasets/lrs3-preprocessed/lrs3_video_seg24s/test/0Fi83BHQsMA/00004.wav"
+VIDEO_PATH="/ceph/shared/ALL/datasets/lrs3-preprocessed/lrs3_video_seg24s/test/0Fi83BHQsMA/00004.mp4"
 # --------------------------
 
 export PYTHONPATH="$ROOT/fairseq:$ROOT:$PYTHONPATH"

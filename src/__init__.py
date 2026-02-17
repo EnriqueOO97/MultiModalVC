@@ -7,3 +7,6 @@ from .task import *
 from .dataset import *
 from .criterion import *
 from .model import *
+from .modelSpeech import *
+from .criterionSpeech import *
+from .modelSpeechNoLLM import *
