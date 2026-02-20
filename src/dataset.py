@@ -312,9 +312,10 @@ class mms_llama_dataset(FairseqDataset):
         else:
             audio_feats = None
             audio_len_samples = None
+            wav_data = None
             
         
-        return video_feats, audio_feats, audio_len_samples
+        return video_feats, audio_feats, audio_len_samples, wav_data
 
     def load_video(self, audio_name):
         feats = custom_utils.load_video(os.path.join(self.audio_root, audio_name))
@@ -324,7 +325,7 @@ class mms_llama_dataset(FairseqDataset):
 
 
     def __getitem__(self, index):
-        video_feats, audio_feats, audio_len_samples = self.load_feature(self.names[index])
+        video_feats, audio_feats, audio_len_samples, wav_data = self.load_feature(self.names[index])
         video_feats = torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
 
         labels = [self.llm_tokenizer(self.label_list[0][index], return_tensors="pt").input_ids[0]]
@@ -354,9 +355,12 @@ class mms_llama_dataset(FairseqDataset):
             except Exception as e:
                 logger.warning(f"Failed to load mel target at {mel_path}: {e}")
 
+        # Raw waveform for E2E training (discriminator + mel reconstruction loss)
+        target_waveform = torch.from_numpy(wav_data).float() if wav_data is not None else None
+
         return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, 
                 "audio_len_samples": audio_len_samples, "label_list": labels, 'text_source':[txt_feats], 
-                'sr_label': sr_label, 'target_mel': target_mel}
+                'sr_label': sr_label, 'target_mel': target_mel, 'target_waveform': target_waveform}
 
     def __len__(self):
         return len(self.sizes)
@@ -466,6 +470,17 @@ class mms_llama_dataset(FairseqDataset):
         if collated_target_mels is not None:
             batch['target_mel'] = collated_target_mels
             batch['mel_lengths'] = mel_lengths  # Actual per-sample mel lengths for masking
+        
+        # Raw waveforms for E2E training
+        target_waveforms = [s.get("target_waveform") for s in samples]
+        if target_waveforms[0] is not None:
+            waveform_lengths = torch.tensor([w.size(0) for w in target_waveforms], dtype=torch.long)
+            max_wav_len = waveform_lengths.max().item()
+            collated_waveforms = target_waveforms[0].new_zeros(len(target_waveforms), max_wav_len)
+            for i, w in enumerate(target_waveforms):
+                collated_waveforms[i, :w.size(0)] = w
+            batch['target_waveform'] = collated_waveforms
+            batch['waveform_lengths'] = waveform_lengths
         
         return batch
         

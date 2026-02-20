@@ -10,3 +10,5 @@ from .model import *
 from .modelSpeech import *
 from .criterionSpeech import *
 from .modelSpeechNoLLM import *
+from .modelSpeechNoLLM_E2E import *
+from .criterionSpeechE2E import *

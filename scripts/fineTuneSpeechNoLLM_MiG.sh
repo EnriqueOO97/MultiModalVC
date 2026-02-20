@@ -71,9 +71,9 @@ fairseq-hydra-train \
     model.modality_fuse=cross-att \
     model.use_qformer=true \
     model.use_sr_predictor=true \
-    model.p_modality_av=0.0 \
+    model.p_modality_av=0.5 \
     model.p_modality_video_only=0.5 \
-    model.p_modality_audio_only=0.5 \
+    model.p_modality_audio_only=0.0 \
     optimization.update_freq=[4] \
     optimization.lr=[1e-4] \
     optimizer._name=adam \
