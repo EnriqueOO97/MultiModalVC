@@ -121,6 +121,7 @@ model:
   p_modality_audio_only: 0.0
   
   ##### E2E Specific #######
+  stage1_checkpoint: ???
   vocoder_checkpoint: ???
   freeze_stage1: true
   

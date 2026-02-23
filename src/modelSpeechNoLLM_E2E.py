@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MMS_Speech_NoLLM_E2E_Config(MMS_Speech_NoLLM_Config):
+    # Path to pretrained Stage 1 checkpoint (conformer, projections, Q-Former, etc.)
+    stage1_checkpoint: str = field(
+        default="???", metadata={"help": "Path to pretrained Stage 1 checkpoint"}
+    )
     # Path to pretrained HiFi-GAN checkpoint (model-best.pt from trainGermanVocoder.py)
     vocoder_checkpoint: str = field(
         default="???", metadata={"help": "Path to pretrained HiFi-GAN checkpoint"}
@@ -59,6 +63,12 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
     def __init__(self, avhubert, whisper, cfg):
         # Initialize all Stage 1 components via parent
         super().__init__(avhubert, whisper, cfg)
+        
+        # =====================================================================
+        # Load pretrained Stage 1 weights (conformer, proj, Q-Former, etc.)
+        # =====================================================================
+        if cfg.stage1_checkpoint and cfg.stage1_checkpoint != "???":
+            self._load_stage1_weights(cfg.stage1_checkpoint)
         
         # mel_head is inherited but will NOT be used in forward_speech
         # We keep it in the state dict so Stage 1 checkpoint loading doesn't break
@@ -114,6 +124,34 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         logger.info(f"[E2E Model] Total params: {sum(p.numel() for p in self.parameters()):,}")
         logger.info(f"[E2E Model] Trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
         logger.info(f"[E2E Model] Frozen params: {sum(p.numel() for p in self.parameters() if not p.requires_grad):,}")
+
+    def _load_stage1_weights(self, checkpoint_path):
+        """Load pretrained Stage 1 weights (conformer, projections, Q-Former, etc.).
+        
+        This mirrors how vocoder weights are loaded internally, so the script
+        doesn't need checkpoint.restore_file and can resume properly.
+        """
+        logger.info(f"[E2E Model] Loading Stage 1 weights from {checkpoint_path}")
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        
+        # Fairseq checkpoints store model weights under 'model'
+        if "model" in state:
+            stage1_state = state["model"]
+        else:
+            stage1_state = state
+        
+        # Load with strict=False since E2E model has extra vocoder/disc params
+        # Use nn.Module.load_state_dict directly (fairseq's override returns None)
+        missing, unexpected = nn.Module.load_state_dict(self, stage1_state, strict=False)
+        
+        # Filter out expected missing/unexpected keys for cleaner logging
+        expected_missing_prefixes = ("vocoder_", "mpd.", "msd.")
+        truly_missing = [k for k in missing if not any(k.startswith(p) for p in expected_missing_prefixes)]
+        if truly_missing:
+            logger.warning(f"[E2E Model] Missing Stage 1 keys: {truly_missing}")
+        if unexpected:
+            logger.info(f"[E2E Model] Unexpected keys from Stage 1 checkpoint (ignored): {len(unexpected)}")
+        logger.info("[E2E Model] Stage 1 weights loaded successfully")
 
     def _load_vocoder_weights(self, checkpoint_path):
         """Load pretrained HiFi-GAN generator weights."""
