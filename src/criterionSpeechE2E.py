@@ -79,6 +79,9 @@ class E2EGanLossConfig(FairseqDataclass):
     mel_loss_weight: float = field(
         default=45.0, metadata={"help": "Weight for mel reconstruction loss"}
     )
+    use_discriminator: bool = field(
+        default=True, metadata={"help": "Enable discriminator training (set False for mel-only phase)"}
+    )
     disc_lr: float = field(
         default=2e-4, metadata={"help": "Discriminator learning rate"}
     )
@@ -89,21 +92,24 @@ class E2EGanLossConfig(FairseqDataclass):
 
 @register_criterion("e2e_gan_loss", dataclass=E2EGanLossConfig)
 class E2EGanLoss(FairseqCriterion):
-    def __init__(self, task, mel_loss_weight=45.0, disc_lr=2e-4, disc_betas="0.8,0.99"):
+    def __init__(self, task, mel_loss_weight=45.0, use_discriminator=True, disc_lr=2e-4, disc_betas="0.8,0.99"):
         super().__init__(task)
         self.mel_loss_weight = mel_loss_weight
+        self.use_discriminator = use_discriminator
         self.disc_lr = disc_lr
         self.disc_betas = tuple(float(x) for x in disc_betas.split(","))
         
         self.logmel = None  # Lazy init on first forward (needs device)
         self.disc_optimizer = None  # Lazy init (needs model reference)
+        
+        logger.info(f"[E2E Criterion] use_discriminator={self.use_discriminator}")
     
     def _lazy_init(self, model, device):
         """Initialize LogMelSpectrogram and discriminator optimizer on first call."""
         if self.logmel is None:
             self.logmel = LogMelSpectrogram().to(device)
         
-        if self.disc_optimizer is None:
+        if self.disc_optimizer is None and self.use_discriminator:
             # Collect discriminator params - enable grad for optimizer
             disc_params = []
             for param in model.mpd.parameters():
@@ -165,60 +171,79 @@ class E2EGanLoss(FairseqCriterion):
         loss_mel = F.l1_loss(mel_pred, mel_gt)
         
         if model.training:
-            # =================================================================
-            # TRAINING: Full GAN loop
-            # =================================================================
+            if self.use_discriminator:
+                # =============================================================
+                # TRAINING: Full GAN loop
+                # =============================================================
+                
+                # --- Discriminator step ---
+                self.disc_optimizer.zero_grad()
+                
+                mpd_real_scores, _ = model.mpd(gt_wav)
+                msd_real_scores, _ = model.msd(gt_wav)
+                
+                mpd_fake_scores, _ = model.mpd(pred_wav.detach())
+                msd_fake_scores, _ = model.msd(pred_wav.detach())
+                
+                loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
+                loss_disc_msd, _, _ = discriminator_loss(msd_real_scores, msd_fake_scores)
+                loss_disc = loss_disc_mpd + loss_disc_msd
+                
+                loss_disc.backward()
+                self.disc_optimizer.step()
+                
+                # --- Generator step ---
+                mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
+                msd_real_scores, msd_real_feats = model.msd(gt_wav)
+                
+                mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
+                msd_fake_scores, msd_fake_feats = model.msd(pred_wav)
+                
+                loss_fm_mpd = feature_loss(mpd_real_feats, mpd_fake_feats)
+                loss_fm_msd = feature_loss(msd_real_feats, msd_fake_feats)
+                loss_fm = loss_fm_mpd + loss_fm_msd
+                
+                loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
+                loss_gen_msd, _ = generator_loss(msd_fake_scores)
+                loss_gen_adv = loss_gen_mpd + loss_gen_msd
+                
+                loss_gen = self.mel_loss_weight * loss_mel + loss_fm + loss_gen_adv
+                
+                logging_output = {
+                    "loss": loss_gen.item(),
+                    "loss_mel": loss_mel.item(),
+                    "loss_fm": loss_fm.item(),
+                    "loss_gen_adv": loss_gen_adv.item(),
+                    "loss_disc": loss_disc.item(),
+                    "sample_size": B,
+                    "nsentences": B,
+                }
+                
+                return loss_gen, B, logging_output
             
-            # --- Discriminator step ---
-            self.disc_optimizer.zero_grad()
-            
-            mpd_real_scores, _ = model.mpd(gt_wav)
-            msd_real_scores, _ = model.msd(gt_wav)
-            
-            mpd_fake_scores, _ = model.mpd(pred_wav.detach())
-            msd_fake_scores, _ = model.msd(pred_wav.detach())
-            
-            loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
-            loss_disc_msd, _, _ = discriminator_loss(msd_real_scores, msd_fake_scores)
-            loss_disc = loss_disc_mpd + loss_disc_msd
-            
-            loss_disc.backward()
-            self.disc_optimizer.step()
-            
-            # --- Generator step ---
-            mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
-            msd_real_scores, msd_real_feats = model.msd(gt_wav)
-            
-            mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
-            msd_fake_scores, msd_fake_feats = model.msd(pred_wav)
-            
-            loss_fm_mpd = feature_loss(mpd_real_feats, mpd_fake_feats)
-            loss_fm_msd = feature_loss(msd_real_feats, msd_fake_feats)
-            loss_fm = loss_fm_mpd + loss_fm_msd
-            
-            loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
-            loss_gen_msd, _ = generator_loss(msd_fake_scores)
-            loss_gen_adv = loss_gen_mpd + loss_gen_msd
-            
-            loss_gen = self.mel_loss_weight * loss_mel + loss_fm + loss_gen_adv
-            
-            logging_output = {
-                "loss": loss_gen.item(),
-                "loss_mel": loss_mel.item(),
-                "loss_fm": loss_fm.item(),
-                "loss_gen_adv": loss_gen_adv.item(),
-                "loss_disc": loss_disc.item(),
-                "sample_size": B,
-                "nsentences": B,
-            }
-            
-            return loss_gen, B, logging_output
+            else:
+                # =============================================================
+                # TRAINING: Mel-only (Phase 1 — no discriminator)
+                # =============================================================
+                loss_gen = loss_mel
+                
+                logging_output = {
+                    "loss": loss_gen.item(),
+                    "loss_mel": loss_mel.item(),
+                    "loss_fm": 0.0,
+                    "loss_gen_adv": 0.0,
+                    "loss_disc": 0.0,
+                    "sample_size": B,
+                    "nsentences": B,
+                }
+                
+                return loss_gen, B, logging_output
         
         else:
             # =================================================================
             # VALIDATION: Only mel loss + metrics (no GAN ops)
             # =================================================================
-            loss_gen = self.mel_loss_weight * loss_mel
+            loss_gen = loss_mel
             
             logging_output = {
                 "loss": loss_gen.item(),

@@ -12,3 +12,7 @@ from .criterionSpeech import *
 from .modelSpeechNoLLM import *
 from .modelSpeechNoLLM_E2E import *
 from .criterionSpeechE2E import *
+from .task_synthvc import *
+from .dataset_synthvc import *
+from .modelSpeechNoLLM_E2E_SynthVC import *
+from .criterionSpeechE2E_SynthVC import *
