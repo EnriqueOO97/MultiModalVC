@@ -5,6 +5,7 @@
 
 from .task import *
 from .dataset import *
+from .dataset_synthvc import *
 from .criterion import *
 from .model import *
 from .modelSpeech import *
@@ -13,6 +14,5 @@ from .modelSpeechNoLLM import *
 from .modelSpeechNoLLM_E2E import *
 from .criterionSpeechE2E import *
 from .task_synthvc import *
-from .dataset_synthvc import *
 from .modelSpeechNoLLM_E2E_SynthVC import *
 from .criterionSpeechE2E_SynthVC import *

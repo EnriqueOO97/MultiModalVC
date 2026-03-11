@@ -121,7 +121,7 @@ else
         checkpoint.save_dir=${OUT_PATH}/checkpoints \
         model.w2v_path=$ROOT/pretrained_models/avhubert/large_vox_iter5.pt \
         model.queries_per_sec=$QPS \
-        model.modality_fuse=cross-attention \
+        model.modality_fuse=cross-att \
         model.use_qformer=true \
         model.use_sr_predictor=true \
         model.p_modality_av=0.75 \

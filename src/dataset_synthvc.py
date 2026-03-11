@@ -35,7 +35,7 @@ import soundfile as sf
 
 DBG = True if len(sys.argv) == 1 else False
 
-import src.utils as custom_utils
+from . import utils as custom_utils
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def load_audio_visual_synthvc(manifest_path, max_keep, min_keep, frame_rate, lab
         root = f.readline().strip()
         for ind, line in enumerate(f):
             items = line.strip().split("\t")
-            sz = int(items[-2])  # audio sample count (second to last)
+            sz = int(items[-3])  # video sample count (second to last)
             if min_keep is not None and sz < min_keep:
                 n_short += 1
             elif max_keep is not None and sz > max_keep:

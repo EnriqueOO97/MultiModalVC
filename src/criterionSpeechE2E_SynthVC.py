@@ -22,7 +22,7 @@ from fairseq.dataclass import FairseqDataclass
 
 from .criterionSpeechE2E import E2EGanLoss, E2EGanLossConfig, LogMelSpectrogram
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("src.criterionSpeechE2E_SynthVC")
 
 
 @dataclass
