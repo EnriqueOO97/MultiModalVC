@@ -121,7 +121,6 @@ class MMS_LLaMA_TrainingSynthVCTask(FairseqTask):
         self.datasets[split] = mms_synthvc_dataset(
             manifest,
             sample_rate=self.cfg.sample_rate,
-            llm_path=self.cfg.llm_path,
             label_paths=paths,
             label_rates=self.cfg.label_rate,
             max_keep_sample_size=self.cfg.max_sample_size,

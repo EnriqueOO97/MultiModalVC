@@ -34,7 +34,7 @@ fi
 
 QPS=3
 RUN_NAME=${RUN_NAME:-default_run}
-OUT_PATH=$ROOT/exp/mms-speech-NoLLM-E2E-SynthVC/$RUN_NAME
+OUT_PATH=/gpfs/data/fs72969/enriqueoo97/exp/mms-speech-NoLLM-E2E-SynthVC/$RUN_NAME
 
 # Pretrained checkpoints
 STAGE1_CKPT=$ROOT/pretrained_models/checkpoint_last.pt
@@ -131,7 +131,7 @@ else
         model.vocoder_checkpoint=${VOCODER_CKPT} \
         model.freeze_stage1=false \
         +criterion.use_discriminator=${USE_DISC:-false} \
-        criterion.conv_loss_weight=${CONV_LOSS_WEIGHT:-5.0} \
+        criterion.conv_loss_weight=${CONV_LOSS_WEIGHT:-10.0} \
         optimization.update_freq=[4] \
         optimization.lr=[2e-4] \
         optimizer._name=adam \

@@ -25,10 +25,9 @@ from typing import Any, List, Optional, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-from fairseq.data import data_utils
 from fairseq.data.fairseq_dataset import FairseqDataset
 from scipy.io import wavfile
-from transformers import AutoTokenizer, WhisperProcessor
+from transformers import WhisperProcessor
 import math
 import torchaudio
 import soundfile as sf
@@ -115,7 +114,6 @@ class mms_synthvc_dataset(FairseqDataset):
             self,
             manifest_path: str,
             sample_rate: float,
-            llm_path: str,
             label_paths: List[str],
             label_rates: Union[List[float], float],
             max_keep_sample_size: Optional[int] = None,
@@ -161,10 +159,7 @@ class mms_synthvc_dataset(FairseqDataset):
         self.shuffle = shuffle
         self.random_crop = random_crop
 
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_path)
-        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium.en")
-        self.llm_tokenizer.pad_token_id = self.llm_tokenizer.eos_token_id
-        self.llm_tokenizer.sep_token_id = self.llm_tokenizer.unk_token_id
+        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
         self.num_labels = len(label_paths)
         self.single_target = single_target
         self.store_labels = store_labels
@@ -297,11 +292,7 @@ class mms_synthvc_dataset(FairseqDataset):
         # === Video features to tensor ===
         video_feats = torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
 
-        # === Labels (same as original) ===
-        labels = [self.llm_tokenizer(self.label_list[0][index], return_tensors="pt").input_ids[0]]
-        labels = [torch.cat((labels[0], torch.tensor([self.llm_tokenizer.eos_token_id]).long()))]
         fid = self.names[index][1].split(':')[1]
-        txt_feats = self.llm_tokenizer("Focus on semantics, not voice characteristics", return_tensors="pt").input_ids[0]
         speech_rate = self.speech_rates[index]
         sr_label = torch.tensor(float(speech_rate), dtype=torch.float32)
 
@@ -314,8 +305,6 @@ class mms_synthvc_dataset(FairseqDataset):
             "video_source": video_feats,
             "audio_source": canon_audio_feats,
             "audio_len_samples": canon_audio_len_samples,
-            "label_list": labels,
-            "text_source": [txt_feats],
             "sr_label": sr_label,
             "target_waveform": target_waveform,
             # SynthVC-specific
@@ -371,19 +360,9 @@ class mms_synthvc_dataset(FairseqDataset):
 
         sr_labels = torch.stack([s["sr_label"] for s in samples])
 
-        targets_by_label = [
-            [s["label_list"][i] for s in samples]
-            for i in range(self.num_labels)
-        ]
-        text_instructions = [
-            [s["text_source"][i] for s in samples]
-            for i in range(self.num_labels)
-        ]
-
         source = {
             "audio": collated_audios,
             "video": collated_videos,
-            "instruction": text_instructions[0],
         }
         if audio_len_samples is not None:
             source["audio_lengths"] = torch.tensor(audio_len_samples, dtype=torch.long)
@@ -394,7 +373,6 @@ class mms_synthvc_dataset(FairseqDataset):
             "net_input": net_input,
             "utt_id": [s['fid'] for s in samples],
         }
-        batch['target'] = targets_by_label[0]
         batch['sr_labels'] = sr_labels
 
         # === Target waveform (canonical) ===
@@ -451,17 +429,7 @@ class mms_synthvc_dataset(FairseqDataset):
             collated_audios = collated_audios.permute((0, 4, 1, 2, 3)).contiguous()
         return collated_audios, padding_mask, audio_starts
 
-    def collater_seq_label_llm(self, targets):
-        lengths = torch.LongTensor([len(t) for t in targets])
-        ntokens = lengths.sum().item()
-        pad = self.llm_tokenizer("<|finetune_right_pad_id|>").input_ids[1]
-        eos = self.llm_tokenizer.eos_token_id
-        targets_ = data_utils.collate_tokens(targets, pad_idx=pad, eos_idx=eos, left_pad=False)
-        new_targets = [tar[1:] for tar in targets]
-        prev_output_tokens = data_utils.collate_tokens(
-            new_targets, pad_idx=pad, eos_idx=eos, left_pad=False, move_eos_to_beginning=False
-        )
-        return (targets_, prev_output_tokens), lengths, ntokens
+
 
     def num_tokens(self, index):
         return self.size(index)

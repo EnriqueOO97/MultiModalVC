@@ -34,7 +34,7 @@ class E2EGanLossSynthVCConfig(E2EGanLossConfig):
 
 @register_criterion("e2e_gan_loss_synthvc", dataclass=E2EGanLossSynthVCConfig)
 class E2EGanLossSynthVC(E2EGanLoss):
-    def __init__(self, task, mel_loss_weight=45.0, use_discriminator=True,
+    def __init__(self, task, mel_loss_weight=40.0, use_discriminator=True,
                  disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0):
         super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas)
         self.conv_loss_weight = conv_loss_weight
