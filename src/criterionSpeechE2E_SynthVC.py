@@ -107,8 +107,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
             # for both passes' interpolation
             min_t = min(canonical_features.size(1), target_features.size(1))
             loss_conv = F.l1_loss(
-                canonical_features[:, :min_t, :],
-                target_features[:, :min_t, :].detach()  # detach target to not backprop through synth path twice
+                target_features[:, :min_t, :],
+                canonical_features[:, :min_t, :].detach()  # canonical is the fixed teacher; gradients flow only through synthetic path
             )
 
         # =====================================================================
