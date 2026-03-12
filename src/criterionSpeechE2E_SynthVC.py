@@ -154,6 +154,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss": loss_gen.item(),
                     "loss_mel": loss_mel.item(),
                     "loss_conv": loss_conv.item(),
+                    "loss_mel_weighted": (self.mel_loss_weight * loss_mel).item(),
+                    "loss_conv_weighted": (self.conv_loss_weight * loss_conv).item(),
                     "loss_fm": loss_fm.item(),
                     "loss_gen_adv": loss_gen_adv.item(),
                     "loss_disc": loss_disc.item(),
@@ -170,6 +172,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss": loss_gen.item(),
                     "loss_mel": loss_mel.item(),
                     "loss_conv": loss_conv.item(),
+                    "loss_mel_weighted": (self.mel_loss_weight * loss_mel).item(),
+                    "loss_conv_weighted": (self.conv_loss_weight * loss_conv).item(),
                     "loss_fm": 0.0,
                     "loss_gen_adv": 0.0,
                     "loss_disc": 0.0,
@@ -185,6 +189,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 "loss": loss_gen.item(),
                 "loss_mel": loss_mel.item(),
                 "loss_conv": loss_conv.item(),
+                "loss_mel_weighted": (self.mel_loss_weight * loss_mel).item(),
+                "loss_conv_weighted": (self.conv_loss_weight * loss_conv).item(),
                 "loss_fm": 0.0,
                 "loss_gen_adv": 0.0,
                 "loss_disc": 0.0,
@@ -217,7 +223,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
         metrics.log_scalar("loss", loss_sum / n_batches, priority=100, round=4)
 
-        for key in ["loss_mel", "loss_conv", "loss_fm", "loss_gen_adv", "loss_disc"]:
+        for key in ["loss_mel", "loss_conv", "loss_mel_weighted", "loss_conv_weighted", "loss_fm", "loss_gen_adv", "loss_disc"]:
             val_sum = sum(log.get(key, 0) for log in logging_outputs)
             metrics.log_scalar(key, val_sum / n_batches, priority=90, round=4)
 

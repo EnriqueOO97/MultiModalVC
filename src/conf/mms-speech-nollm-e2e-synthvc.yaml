@@ -11,11 +11,11 @@ common:
 
 checkpoint:
   save_interval: 1
-  keep_interval_updates: 1
-  save_interval_updates: 2500
+  keep_last_epochs: 1
+  save_interval_updates: 0
   best_checkpoint_metric: loss
   maximize_best_checkpoint_metric: false
-  no_epoch_checkpoints: true
+  no_epoch_checkpoints: false
 
 distributed_training:
   ddp_backend: c10d
