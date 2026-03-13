@@ -111,11 +111,14 @@ class MMS_LLaMA_TrainingSynthVCTask(FairseqTask):
         return self.cfg.label_dir
 
     def load_dataset(self, split: str, **kwargs) -> None:
+        # Intercept valid_synth to use the valid manifest but execute the dataset swap logic
+        manifest_split = 'valid' if split == 'valid_synth' else split
+        
         # Use *Augmented.tsv manifests
-        manifest = f"{self.cfg.data}/{split}Augmented.tsv"
-        logger.info(f"Loading SynthVC augmented manifest: {manifest}")
+        manifest = f"{self.cfg.data}/{manifest_split}Augmented.tsv"
+        logger.info(f"Loading SynthVC augmented manifest for split '{split}' from: {manifest}")
 
-        paths = [f"{self.get_label_dir()}/{split}.{l}" for l in self.cfg.labels]
+        paths = [f"{self.get_label_dir()}/{manifest_split}.{l}" for l in self.cfg.labels]
         image_aug = self.cfg.image_aug if split == 'train' else False
 
         self.datasets[split] = mms_synthvc_dataset(
@@ -142,6 +145,7 @@ class MMS_LLaMA_TrainingSynthVCTask(FairseqTask):
             noise_fn=self.cfg.noise_wav,
             noise_prob=self.cfg.noise_prob,
             snr_target=self.cfg.snr_target,
+            subset_name=split,  # Pass the explicit split name to the dataset
         )
 
     def max_positions(self) -> Tuple[int, int]:

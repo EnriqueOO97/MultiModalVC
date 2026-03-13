@@ -137,7 +137,8 @@ class mms_synthvc_dataset(FairseqDataset):
             noise_prob=0,
             noise_snr=0,
             noise_num=1,
-            snr_target=None
+            snr_target=None,
+            subset_name=None
     ):
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
@@ -166,6 +167,7 @@ class mms_synthvc_dataset(FairseqDataset):
         self.is_s2s = is_s2s
 
         self.subset = manifest_path.split('/')[-1].split('.')[0]
+        self.subset_name = subset_name if subset_name is not None else self.subset
         self.snr_target = snr_target
         self.snr_levels = [-5, 0, 5, 10, 15, 20]
 
@@ -299,12 +301,21 @@ class mms_synthvc_dataset(FairseqDataset):
         # === Target waveform (canonical, for mel loss) ===
         target_waveform = torch.from_numpy(canon_wav_data).float() if canon_wav_data is not None else None
 
+        # === Swap logic for double validation ===
+        if self.subset_name == 'valid_synth' and synth_audio_feats is not None:
+            # Swap canonical inputs for synthetic ones for the model's main pass
+            audio_feats_to_return = synth_audio_feats
+            audio_len_to_return = synth_audio_len_samples
+        else:
+            audio_feats_to_return = canon_audio_feats
+            audio_len_to_return = canon_audio_len_samples
+
         return {
             "id": index,
             "fid": fid,
             "video_source": video_feats,
-            "audio_source": canon_audio_feats,
-            "audio_len_samples": canon_audio_len_samples,
+            "audio_source": audio_feats_to_return,
+            "audio_len_samples": audio_len_to_return,
             "sr_label": sr_label,
             "target_waveform": target_waveform,
             # SynthVC-specific
