@@ -148,7 +148,8 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         raise NotImplementedError("Use forward_speech directly")
 
     def _run_pipeline_to_conformer(self, whisper_enc_out, avhubert_output, video_lengths,
-                                    max_vid_len, target_lengths, max_target_len, spk_emb):
+                                    max_vid_len, target_lengths, max_target_len, spk_emb,
+                                    mode='av'):
         """Run pipeline from fused features through conformer with cross-attention.
 
         This is the shared core between canonical and synthetic passes, starting
@@ -162,6 +163,8 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
             target_lengths: (B,) target mel frame lengths for interpolation
             max_target_len: scalar, max target length
             spk_emb: (B, 1, 512) speaker embedding for cross-attention
+            mode: modality dropout mode ('av', 'video_only', 'audio_only') —
+                  sampled ONCE in forward_speech and shared across both passes.
 
         Returns:
             conformer_features: (B, T, 512) — output of conformer + ln3
@@ -183,17 +186,11 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         B_dim, T_v, _ = avhubert_output['encoder_out'].size()
         whisper_proc = whisper_proc[:, :T_v, :]
 
-        # 2. Modality dropout (training only)
-        mode = 'av'
-        if self.training:
-            mode = random.choices(
-                ['av', 'video_only', 'audio_only'],
-                weights=[self.cfg.p_modality_av, self.cfg.p_modality_video_only, self.cfg.p_modality_audio_only]
-            )[0]
-            if mode == 'video_only':
-                whisper_proc = self.audio_mask_emb.unsqueeze(0).unsqueeze(0).expand_as(whisper_proc)
-            elif mode == 'audio_only':
-                avhubert_output['encoder_out'] = self.video_mask_emb.unsqueeze(0).unsqueeze(0).expand_as(avhubert_output['encoder_out'])
+        # 2. Modality dropout — mode is pre-determined by the caller, not sampled here
+        if mode == 'video_only':
+            whisper_proc = self.audio_mask_emb.unsqueeze(0).unsqueeze(0).expand_as(whisper_proc)
+        elif mode == 'audio_only':
+            avhubert_output['encoder_out'] = self.video_mask_emb.unsqueeze(0).unsqueeze(0).expand_as(avhubert_output['encoder_out'])
 
         # 3. Fuse modalities
         if self.modality_fuse == 'concat':
@@ -314,6 +311,16 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         max_target_len = int(target_lengths.max().item())
 
         # =====================================================================
+        # SHARED: Sample modality dropout mode ONCE for both passes
+        # =====================================================================
+        mode = 'av'
+        if self.training:
+            mode = random.choices(
+                ['av', 'video_only', 'audio_only'],
+                weights=[self.cfg.p_modality_av, self.cfg.p_modality_video_only, self.cfg.p_modality_audio_only]
+            )[0]
+
+        # =====================================================================
         # STEP 1: CANONICAL PASS
         # =====================================================================
         with torch.no_grad():
@@ -328,7 +335,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
 
         canonical_features = self._run_pipeline_to_conformer(
             whisper_enc_out_canon, avhubert_output_canon, video_lengths,
-            max_vid_len, target_lengths, max_target_len, spk_emb
+            max_vid_len, target_lengths, max_target_len, spk_emb, mode=mode
         )
 
         # Route canonical features through vocoder → waveform
@@ -360,7 +367,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
 
             target_features = self._run_pipeline_to_conformer(
                 whisper_enc_out_synth, avhubert_output_synth, video_lengths,
-                max_vid_len, target_lengths, max_target_len, spk_emb
+                max_vid_len, target_lengths, max_target_len, spk_emb, mode=mode
             )
             # STOP HERE — no vocoder for synthetic pass
 
