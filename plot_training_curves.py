@@ -148,15 +148,8 @@ for tag in ordered_tags:
             continue
         steps, values = run_data[tag]
         color = RUN_COLORS.get(run_name, '#a6e3a1')
-        # Raw data (faint)
-        ax.plot(steps, values, alpha=0.2, color=color, linewidth=0.8)
-        # Smoothed data (bold)
-        if len(values) > 1:
-            ax.plot(steps, smooth(values), alpha=0.9, color=color,
-                    linewidth=2, label=run_name)
-        else:
-            ax.plot(steps, values, alpha=0.9, color=color,
-                    linewidth=2, label=run_name, marker='o')
+        ax.plot(steps, values, alpha=0.9, color=color,
+                linewidth=2, label=run_name, marker=('o' if len(values) == 1 else None))
     ax.set_title(tag, fontsize=14, fontweight='bold', color='#cdd6f4')
     ax.set_xlabel('Step')
     ax.legend(loc='best', fontsize=9)
@@ -180,14 +173,9 @@ for tag in key_present:
             continue
         steps, values = run_data[tag]
         color = RUN_COLORS.get(run_name, '#a6e3a1')
-        ax.plot(steps, values, alpha=0.15, color=color, linewidth=0.8)
-        if len(values) > 1:
-            smoothed = smooth(values)
-            ax.plot(steps, smoothed, alpha=0.9, color=color,
-                    linewidth=2.5, label=f"{run_name} (last={values[-1]:.4f})")
-        else:
-            ax.plot(steps, values, alpha=0.9, color=color,
-                    linewidth=2.5, label=f"{run_name} ({values[-1]:.4f})", marker='o')
+        ax.plot(steps, values, alpha=0.9, color=color,
+                linewidth=2.5, label=f"{run_name} (last={values[-1]:.4f})",
+                marker=('o' if len(values) == 1 else None))
     ax.set_title(tag.upper(), fontsize=16, fontweight='bold', color='#f5c2e7')
     ax.set_xlabel('Step', fontsize=12)
     ax.set_ylabel(tag, fontsize=12)

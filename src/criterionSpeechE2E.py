@@ -277,6 +277,29 @@ class E2EGanLoss(FairseqCriterion):
             
             return loss_gen, B, logging_output
 
+    def state_dict(self):
+        """Override to save the discriminator optimizer and update states."""
+        state = super().state_dict()
+        if self.disc_optimizer is not None:
+            state["disc_optimizer_state"] = self.disc_optimizer.state_dict()
+        if hasattr(self, "_num_updates"):
+            state["criterion_num_updates"] = self._num_updates
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Override to load the discriminator optimizer and update states."""
+        disc_state = state_dict.pop("disc_optimizer_state", None)
+        num_updates = state_dict.pop("criterion_num_updates", None)
+        super().load_state_dict(state_dict, strict)
+        
+        if disc_state is not None and self.disc_optimizer is not None:
+            self.disc_optimizer.load_state_dict(disc_state)
+            logger.info("[E2E Criterion] Successfully loaded disc_optimizer state")
+            
+        if num_updates is not None and hasattr(self, "_num_updates"):
+            self._num_updates = num_updates
+            logger.info(f"[E2E Criterion] Successfully loaded _num_updates={self._num_updates}")
+
     @staticmethod
     def reduce_metrics(logging_outputs) -> None:
         """Aggregate logging outputs from data parallel training."""

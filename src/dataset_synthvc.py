@@ -259,11 +259,14 @@ class mms_synthvc_dataset(FairseqDataset):
 
         # === Canonical audio ===
         canon_wav_data = None
+        canon_wav_data_clean = None
         canon_audio_feats = None
         canon_audio_len_samples = None
         if 'audio' in self.modalities:
             audio_path = audio_fn.split(':')[0]
             canon_wav_data, sr = self._load_wav(audio_path)
+            # Keep a clean copy BEFORE noise injection (used as GT in Phase 2)
+            canon_wav_data_clean = canon_wav_data.copy()
             if self.subset == 'train' and np.random.rand() < self.noise_prob:
                 canon_wav_data = self.add_noise(canon_wav_data)
             elif self.subset == 'test' and self.snr_target is not None:
@@ -300,6 +303,8 @@ class mms_synthvc_dataset(FairseqDataset):
 
         # === Target waveform (canonical, for mel loss) ===
         target_waveform = torch.from_numpy(canon_wav_data).float() if canon_wav_data is not None else None
+        # Clean waveform without noise (used as GT target during Phase 2)
+        target_waveform_clean = torch.from_numpy(canon_wav_data_clean).float() if canon_wav_data_clean is not None else None
 
         # === Swap logic for double validation ===
         if self.subset_name == 'valid_synth' and synth_audio_feats is not None:
@@ -318,6 +323,7 @@ class mms_synthvc_dataset(FairseqDataset):
             "audio_len_samples": audio_len_to_return,
             "sr_label": sr_label,
             "target_waveform": target_waveform,
+            "target_waveform_clean": target_waveform_clean,
             # SynthVC-specific
             "spk_embedding": spk_embedding,           # (512,)
             "synth_audio_source": synth_audio_feats,   # (1, 80, T_whisper)
@@ -383,10 +389,11 @@ class mms_synthvc_dataset(FairseqDataset):
             "id": torch.LongTensor([s["id"] for s in samples]),
             "net_input": net_input,
             "utt_id": [s['fid'] for s in samples],
+            "subset_name": self.subset_name,
         }
         batch['sr_labels'] = sr_labels
 
-        # === Target waveform (canonical) ===
+        # === Target waveform (canonical — possibly noisy for Phase 1) ===
         target_waveforms = [s.get("target_waveform") for s in samples]
         if target_waveforms[0] is not None:
             waveform_lengths = torch.tensor([w.size(0) for w in target_waveforms], dtype=torch.long)
@@ -396,6 +403,15 @@ class mms_synthvc_dataset(FairseqDataset):
                 collated_waveforms[i, :w.size(0)] = w
             batch['target_waveform'] = collated_waveforms
             batch['waveform_lengths'] = waveform_lengths
+
+        # === Target waveform clean (no noise — used as GT in Phase 2) ===
+        target_waveforms_clean = [s.get("target_waveform_clean") for s in samples]
+        if target_waveforms_clean[0] is not None:
+            max_wav_len_clean = max(w.size(0) for w in target_waveforms_clean)
+            collated_waveforms_clean = target_waveforms_clean[0].new_zeros(len(target_waveforms_clean), max_wav_len_clean)
+            for i, w in enumerate(target_waveforms_clean):
+                collated_waveforms_clean[i, :w.size(0)] = w
+            batch['target_waveform_clean'] = collated_waveforms_clean
 
         # === SynthVC-specific: speaker embeddings ===
         spk_embeddings = [s["spk_embedding"] for s in samples]

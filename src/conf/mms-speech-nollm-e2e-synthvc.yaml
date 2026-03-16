@@ -57,6 +57,7 @@ criterion:
   _name: e2e_gan_loss_synthvc
   mel_loss_weight: 45.0
   conv_loss_weight: 5.0
+  disc_start_updates: 30000
   disc_lr: 2e-4
   disc_betas: "0.8,0.99"
 

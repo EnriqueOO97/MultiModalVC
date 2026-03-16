@@ -1,14 +1,16 @@
 """
 SynthVC-Inspired E2E Criterion with Conversion Loss.
 
-Extends E2EGanLoss to add conversion loss:
-    Loss = mel_loss_weight * mel_loss + conv_loss_weight * conversion_loss
-
-When use_discriminator=false (Phase 1):
+Phase 1 (disc_active=False):
     Loss = mel_loss_weight * mel_loss + conv_loss_weight * L1(canonical_features, target_features)
+    Model runs two-step forward (canonical → waveform + synthetic → features).
 
-When use_discriminator=true (Phase 2):
-    Loss = mel_loss_weight * mel_loss + conv_loss_weight * conversion_loss + feat_matching + adversarial
+Phase 2 (disc_active=True):
+    Loss = mel_loss_weight * mel_loss + GAN losses (discriminator + feature matching)
+    Model runs single synthetic-only forward → waveform.
+    No conversion loss. Standard HiFi-GAN adversarial training.
+
+disc_active is determined by: use_discriminator flag OR num_updates >= disc_start_updates.
 """
 
 import logging
@@ -30,28 +32,103 @@ class E2EGanLossSynthVCConfig(E2EGanLossConfig):
     conv_loss_weight: float = field(
         default=5.0, metadata={"help": "Weight for conversion loss (SynthVC uses 45:5 mel:conv ratio)"}
     )
+    disc_start_updates: int = field(
+        default=30000, metadata={"help": "Auto-activate discriminator after this many updates"}
+    )
 
 
 @register_criterion("e2e_gan_loss_synthvc", dataclass=E2EGanLossSynthVCConfig)
 class E2EGanLossSynthVC(E2EGanLoss):
     def __init__(self, task, mel_loss_weight=40.0, use_discriminator=True,
-                 disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0):
+                 disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0,
+                 disc_start_updates=30000):
         super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas)
         self.conv_loss_weight = conv_loss_weight
-        logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}")
+        self.disc_start_updates = disc_start_updates
+        self._num_updates = 0
+        logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}, "
+                     f"disc_start_updates={self.disc_start_updates}")
+
+    def _is_disc_active(self, model=None):
+        """Determine if the discriminator phase is active."""
+        if self.use_discriminator:
+            return True
+        
+        # Use global update count from model if available (syncs across resumes)
+        update_num = getattr(model, "num_updates", 0) if model is not None else 0
+        
+        # We assume update_freq=4 for the threshold (matching user's DISK_START_UPDATES=40000)
+        # Fairseq num_updates is optimizer steps. 10k steps * 4 = 40k.
+        effective_updates = max(self._num_updates, update_num * 4)
+        return effective_updates >= self.disc_start_updates
+
+    def _lazy_init(self, model, device):
+        """Initialize LogMelSpectrogram and discriminator optimizer.
+        Unlike the base E2EGanLoss, we ALWAYS initialize the disc_optimizer
+        because we might transition to disc_active=True mid-training.
+        """
+        if self.logmel is None:
+            self.logmel = LogMelSpectrogram().to(device)
+
+        if self.disc_optimizer is None:
+            # Collect discriminator params - enable grad for optimizer
+            disc_params = []
+            for param in model.mpd.parameters():
+                param.requires_grad = True
+                disc_params.append(param)
+            for param in model.msd.parameters():
+                param.requires_grad = True
+                disc_params.append(param)
+
+            self.disc_optimizer = torch.optim.AdamW(
+                disc_params,
+                lr=self.disc_lr,
+                betas=self.disc_betas,
+            )
+            logger.info(f"[SynthVC Criterion] Initialized disc optimizer with lr={self.disc_lr}, "
+                       f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}")
 
     def forward(self, model, sample, reduce=True):
         """
-        Forward with conversion loss.
-        
-        The model returns canonical_features and target_features alongside
-        the waveform. We compute conversion_loss = L1(canonical, target)
-        and add it to the total loss.
+        Forward with phase-aware loss computation.
+
+        Phase 1 (disc_active=False): mel loss + conversion loss
+        Phase 2 (disc_active=True):  mel loss + GAN losses (no conversion loss)
         """
         self._lazy_init(model, next(model.parameters()).device)
 
+        # Determine if disc is active
+        disc_active = self._is_disc_active(model)
+
         # =====================================================================
-        # Pass spk_embeddings and synth_audio into the model via net_input
+        # Phase 2 Validation Optimization
+        # Skip canonical 'valid' subset during Phase 2 to save resources
+        # =====================================================================
+        subset_name = sample.get("subset_name", "train")
+        if not model.training and disc_active and subset_name == 'valid':
+            B = len(sample.get("id", [0]))
+            logging_output = {
+                "loss": 0.0,
+                "loss_mel": 0.0,
+                "loss_conv": 0.0,
+                "loss_mel_weighted": 0.0,
+                "loss_conv_weighted": 0.0,
+                "loss_fm": 0.0,
+                "loss_gen_adv": 0.0,
+                "loss_disc": 0.0,
+                "disc_active": 1,
+                "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
+                "sample_size": B,
+                "nsentences": B,
+                "val_mel_loss": 0.0,
+                "mcd": 0.0,
+                "ssim": 0.0,
+            }
+            device = next(model.parameters()).device
+            return torch.tensor(0.0, device=device), B, logging_output
+
+        # =====================================================================
+        # Pass spk_embeddings, synth_audio, and disc_active into the model
         # =====================================================================
         net_input = dict(sample["net_input"])
         source = dict(net_input.get("source", {}))
@@ -64,21 +141,28 @@ class E2EGanLossSynthVC(E2EGanLoss):
         if "synth_audio" in sample:
             source["synth_audio"] = sample["synth_audio"].to(next(model.parameters()).device)
 
+        # Inject disc_active flag so the model knows which forward mode to use
+        source["disc_active"] = disc_active
+
         net_input["source"] = source
         sample["net_input"] = net_input
 
         # =====================================================================
-        # Model forward → waveform + canonical/target features
+        # Model forward
         # =====================================================================
         net_output = model(**sample["net_input"])
         pred_wav = net_output["waveform"]  # (B, 1, T_pred)
-        canonical_features = net_output.get("canonical_features")  # (B, T, 512)
+        canonical_features = net_output.get("canonical_features")  # (B, T, 512) or None
         target_features = net_output.get("target_features")        # (B, T, 512) or None
 
         # =====================================================================
-        # Mel loss (from waveform, same as parent)
+        # Mel loss (always computed: predicted waveform vs canonical ground truth)
+        # Phase 2 uses clean waveform (no noise), Phase 1 uses potentially noisy
         # =====================================================================
-        gt_wav = sample["target_waveform"].to(pred_wav.device)
+        if disc_active and "target_waveform_clean" in sample:
+            gt_wav = sample["target_waveform_clean"].to(pred_wav.device)
+        else:
+            gt_wav = sample["target_waveform"].to(pred_wav.device)
         if gt_wav.dim() == 2:
             gt_wav = gt_wav.unsqueeze(1)
 
@@ -99,24 +183,17 @@ class E2EGanLossSynthVC(E2EGanLoss):
         loss_mel = F.l1_loss(mel_pred, mel_gt)
 
         # =====================================================================
-        # Conversion loss
-        # =====================================================================
-        loss_conv = torch.tensor(0.0, device=pred_wav.device)
-        if canonical_features is not None and target_features is not None:
-            # Both should have the same shape since we use canonical audio lengths
-            # for both passes' interpolation
-            min_t = min(canonical_features.size(1), target_features.size(1))
-            loss_conv = F.l1_loss(
-                target_features[:, :min_t, :],
-                canonical_features[:, :min_t, :].detach()  # canonical is the fixed teacher; gradients flow only through synthetic path
-            )
-
-        # =====================================================================
-        # Total loss
+        # Training: Phase-aware loss computation
         # =====================================================================
         if model.training:
-            if self.use_discriminator:
-                # Full GAN training with conversion loss
+            # Increment update counter
+            self._num_updates += 1
+
+            if disc_active:
+                # =============================================================
+                # PHASE 2: Standard HiFi-GAN adversarial training
+                # No conversion loss. Waveform comes from synthetic pass.
+                # =============================================================
                 import sys
                 import os
                 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan"))
@@ -147,25 +224,36 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 loss_gen_adv = loss_gen_mpd + loss_gen_msd
 
                 loss_gen = (self.mel_loss_weight * loss_mel
-                            + self.conv_loss_weight * loss_conv
                             + loss_fm + loss_gen_adv)
 
                 logging_output = {
                     "loss": loss_gen.item(),
                     "loss_mel": loss_mel.item(),
-                    "loss_conv": loss_conv.item(),
+                    "loss_conv": 0.0,
                     "loss_mel_weighted": (self.mel_loss_weight * loss_mel).item(),
-                    "loss_conv_weighted": (self.conv_loss_weight * loss_conv).item(),
+                    "loss_conv_weighted": 0.0,
                     "loss_fm": loss_fm.item(),
                     "loss_gen_adv": loss_gen_adv.item(),
                     "loss_disc": loss_disc.item(),
+                    "disc_active": 1,
+                    "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                     "sample_size": B,
                     "nsentences": B,
                 }
                 return loss_gen, B, logging_output
 
             else:
-                # Phase 1: Mel + Conversion only (no discriminator)
+                # =============================================================
+                # PHASE 1: Mel + Conversion only (no discriminator)
+                # =============================================================
+                loss_conv = torch.tensor(0.0, device=pred_wav.device)
+                if canonical_features is not None and target_features is not None:
+                    min_t = min(canonical_features.size(1), target_features.size(1))
+                    loss_conv = F.l1_loss(
+                        target_features[:, :min_t, :],
+                        canonical_features[:, :min_t, :].detach()
+                    )
+
                 loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv
 
                 logging_output = {
@@ -177,12 +265,24 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss_fm": 0.0,
                     "loss_gen_adv": 0.0,
                     "loss_disc": 0.0,
+                    "disc_active": 0,
+                    "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                     "sample_size": B,
                     "nsentences": B,
                 }
                 return loss_gen, B, logging_output
         else:
+            # =================================================================
             # Validation
+            # =================================================================
+            loss_conv = torch.tensor(0.0, device=pred_wav.device)
+            if canonical_features is not None and target_features is not None:
+                min_t = min(canonical_features.size(1), target_features.size(1))
+                loss_conv = F.l1_loss(
+                    target_features[:, :min_t, :],
+                    canonical_features[:, :min_t, :].detach()
+                )
+
             loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv
 
             logging_output = {
@@ -194,6 +294,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 "loss_fm": 0.0,
                 "loss_gen_adv": 0.0,
                 "loss_disc": 0.0,
+                "disc_active": 1 if disc_active else 0,
+                "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                 "sample_size": B,
                 "nsentences": B,
             }
@@ -226,6 +328,14 @@ class E2EGanLossSynthVC(E2EGanLoss):
         for key in ["loss_mel", "loss_conv", "loss_mel_weighted", "loss_conv_weighted", "loss_fm", "loss_gen_adv", "loss_disc"]:
             val_sum = sum(log.get(key, 0) for log in logging_outputs)
             metrics.log_scalar(key, val_sum / n_batches, priority=90, round=4)
+
+        # Log disc_active and num_updates for monitoring
+        disc_active_vals = [log.get("disc_active", 0) for log in logging_outputs]
+        if disc_active_vals:
+            metrics.log_scalar("disc_active", sum(disc_active_vals) / len(disc_active_vals), priority=85, round=0)
+        num_updates_vals = [log.get("num_updates", 0) for log in logging_outputs]
+        if num_updates_vals:
+            metrics.log_scalar("criterion_updates", max(num_updates_vals), priority=84, round=0)
 
         for key, priority in [("mcd", 80), ("ssim", 70), ("val_mel_loss", 60)]:
             values = [log[key] for log in logging_outputs if key in log]

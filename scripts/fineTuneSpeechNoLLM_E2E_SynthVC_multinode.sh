@@ -131,7 +131,9 @@ else
         model.vocoder_checkpoint=${VOCODER_CKPT} \
         model.freeze_stage1=false \
         +criterion.use_discriminator=${USE_DISC:-false} \
+        criterion.mel_loss_weight=${MEL_LOSS_WEIGHT:-1.0} \
         criterion.conv_loss_weight=${CONV_LOSS_WEIGHT:-10.0} \
+        criterion.disc_start_updates=${DISC_START_UPDATES:-120000} \
         optimization.update_freq=[4] \
         optimization.lr=[2e-4] \
         optimizer._name=adam \

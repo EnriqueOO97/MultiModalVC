@@ -60,6 +60,12 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         logger.info(f"[SynthVC Model] Replaced conformer with cross-attention variant")
         logger.info(f"[SynthVC Model] Total params: {sum(p.numel() for p in self.parameters()):,}")
         logger.info(f"[SynthVC Model] Trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
+        self.num_updates = 0
+
+    def set_num_updates(self, num_updates):
+        """Store global update count for criterion to use."""
+        self.num_updates = num_updates
+        super().set_num_updates(num_updates)
 
     @classmethod
     def build_model(cls, cfg, task):
@@ -253,17 +259,29 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         return x
 
     def forward_speech(self, **kwargs):
-        """Two-step forward pass for SynthVC-inspired training.
+        """Forward pass with Phase 1 / Phase 2 / Inference branching.
 
-        Step 1 (Canonical): canonical audio+video → full pipeline → waveform
-        Step 2 (Synthetic): synthetic audio + canonical video → conformer features only
+        Phase 1 (disc_active=False, training):
+            Two-step: canonical→waveform + synthetic→features (for conversion loss)
+
+        Phase 2 (disc_active=True, training):
+            Single synthetic pass: synth audio + canonical video → vocoder → waveform
+            No canonical pass, no conversion loss. Modality forced to 'av'.
+
+        Inference (not training):
+            Single pass: input audio + video + spk_emb → vocoder → waveform
 
         Returns dict with:
-            waveform: (B, 1, T_audio) — from canonical pass
+            waveform: (B, 1, T_audio)
             target_lengths: (B,) — mel frame lengths
-            canonical_features: (B, T, 512) — conformer output from canonical pass
-            target_features: (B, T, 512) — conformer output from synthetic pass
+            canonical_features: (B, T, 512) or None
+            target_features: (B, T, 512) or None
         """
+        # =====================================================================
+        # Determine phase: disc_active flag is set by criterion
+        # =====================================================================
+        disc_active = kwargs['source'].get('disc_active', False)
+
         # =====================================================================
         # SHARED: Extract speaker embeddings
         # =====================================================================
@@ -274,7 +292,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
             spk_emb = spk_emb.unsqueeze(1)  # (B, 512) → (B, 1, 512) for cross-attention
 
         # =====================================================================
-        # SHARED: AV-HuBERT (runs ONCE — same video for both passes)
+        # SHARED: AV-HuBERT (runs ONCE — same video for all passes)
         # =====================================================================
         with torch.no_grad():
             avhubert_source = {'audio': None, 'video': kwargs['source']['video']}
@@ -285,7 +303,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         max_vid_len = max(video_lengths)
 
         # =====================================================================
-        # SHARED: Compute target lengths from canonical audio
+        # SHARED: Compute target lengths from canonical audio lengths
         # =====================================================================
         audio_lengths = None
         if isinstance(kwargs.get('source'), dict):
@@ -311,23 +329,64 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         max_target_len = int(target_lengths.max().item())
 
         # =====================================================================
-        # SHARED: Sample modality dropout mode ONCE for both passes
+        # PHASE 2 / INFERENCE: Single synthetic-only pass through vocoder
         # =====================================================================
-        mode = 'av'
-        if self.training:
-            mode = random.choices(
-                ['av', 'video_only', 'audio_only'],
-                weights=[self.cfg.p_modality_av, self.cfg.p_modality_video_only, self.cfg.p_modality_audio_only]
-            )[0]
+        if disc_active or not self.training:
+            # Force modality to 'av' — no dropout during voice conversion
+            mode = 'av'
+
+            # Use synthetic audio if available, otherwise use whatever audio is in source
+            synth_audio = kwargs['source'].get('synth_audio', None)
+            if synth_audio is None:
+                synth_audio = kwargs.get('synth_audio', None)
+
+            if synth_audio is not None:
+                # Build source with synthetic audio for Whisper
+                synth_source = {
+                    'audio': synth_audio,
+                    'video': kwargs['source']['video'],
+                }
+                with torch.no_grad():
+                    whisper_enc_out = self.whisper(synth_source)
+            else:
+                # Inference fallback: use whatever audio is in source
+                with torch.no_grad():
+                    whisper_enc_out = self.whisper(kwargs['source'])
+
+            avhubert_output_pass = {
+                'encoder_out': avhubert_output['encoder_out'].clone(),
+                'padding_mask': avhubert_output['padding_mask'],
+            }
+
+            features = self._run_pipeline_to_conformer(
+                whisper_enc_out, avhubert_output_pass, video_lengths,
+                max_vid_len, target_lengths, max_target_len, spk_emb, mode=mode
+            )
+
+            # Route through vocoder → waveform
+            x_voc = features.transpose(1, 2)  # (B, 512, T)
+            waveform = self.vocoder_forward(x_voc)  # (B, 1, T_audio)
+
+            return {
+                "waveform": waveform,
+                "target_lengths": target_lengths,
+                "canonical_features": None,
+                "target_features": None,
+            }
 
         # =====================================================================
-        # STEP 1: CANONICAL PASS
+        # PHASE 1: Two-step forward (canonical + synthetic)
         # =====================================================================
+        # Sample modality dropout mode ONCE for both passes
+        mode = random.choices(
+            ['av', 'video_only', 'audio_only'],
+            weights=[self.cfg.p_modality_av, self.cfg.p_modality_video_only, self.cfg.p_modality_audio_only]
+        )[0]
+
+        # --- STEP 1: CANONICAL PASS ---
         with torch.no_grad():
             whisper_enc_out_canon = self.whisper(kwargs['source'])
 
-        # Deep copy avhubert_output for canonical pass (synthetic pass will reuse)
-        import copy
         avhubert_output_canon = {
             'encoder_out': avhubert_output['encoder_out'].clone(),
             'padding_mask': avhubert_output['padding_mask'],
@@ -342,24 +401,20 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         x_voc = canonical_features.transpose(1, 2)  # (B, 512, T)
         waveform = self.vocoder_forward(x_voc)  # (B, 1, T_audio)
 
-        # =====================================================================
-        # STEP 2: SYNTHETIC PASS (only during training, and only if synth data exists)
-        # =====================================================================
+        # --- STEP 2: SYNTHETIC PASS (features only, no vocoder) ---
         target_features = None
         synth_audio = kwargs['source'].get('synth_audio', None)
         if synth_audio is None:
             synth_audio = kwargs.get('synth_audio', None)
 
-        if synth_audio is not None and self.training:
+        if synth_audio is not None:
             with torch.no_grad():
-                # Build a source dict with synthetic audio for Whisper
                 synth_source = {
                     'audio': synth_audio,
-                    'video': kwargs['source']['video'],  # same video
+                    'video': kwargs['source']['video'],
                 }
                 whisper_enc_out_synth = self.whisper(synth_source)
 
-            # Fresh copy of avhubert features for synthetic pass
             avhubert_output_synth = {
                 'encoder_out': avhubert_output['encoder_out'].clone(),
                 'padding_mask': avhubert_output['padding_mask'],
