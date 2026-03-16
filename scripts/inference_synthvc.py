@@ -111,10 +111,11 @@ def load_model(checkpoint_path, manifest_dir, device):
         },
         "model": {
             "w2v_path": w2v_path,
-            # The SynthVC checkpoint already contains all weights — skip re-loading
-            # stage1 / vocoder from their original cluster paths.
-            "stage1_checkpoint": "???",
-            "vocoder_checkpoint": "???",
+            # Empty string is falsy → model's `if cfg.stage1_checkpoint` skips loading.
+            # Do NOT use "???" — that is Hydra's "mandatory missing" sentinel and
+            # OmegaConf will raise "Missing mandatory value" if you assign it.
+            "stage1_checkpoint": "",
+            "vocoder_checkpoint": "",
         },
     }
 
@@ -134,9 +135,11 @@ def load_model(checkpoint_path, manifest_dir, device):
 
         cfg.task.data = manifest_dir
         cfg.task.label_dir = manifest_dir
+        # cfg.model.data is read by build_model as w2v_args.task.data — must not be None
+        cfg.model.data = manifest_dir
         cfg.model.w2v_path = w2v_path
-        cfg.model.stage1_checkpoint = "???"
-        cfg.model.vocoder_checkpoint = "???"
+        cfg.model.stage1_checkpoint = ""
+        cfg.model.vocoder_checkpoint = ""
 
         from src.task_synthvc import MMS_LLaMA_TrainingSynthVCTask
         task = MMS_LLaMA_TrainingSynthVCTask.setup_task(cfg.task)
