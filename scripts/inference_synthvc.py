@@ -111,6 +111,10 @@ def load_model(checkpoint_path, manifest_dir, device):
         },
         "model": {
             "w2v_path": w2v_path,
+            # The SynthVC checkpoint already contains all weights — skip re-loading
+            # stage1 / vocoder from their original cluster paths.
+            "stage1_checkpoint": "???",
+            "vocoder_checkpoint": "???",
         },
     }
 
@@ -125,12 +129,14 @@ def load_model(checkpoint_path, manifest_dir, device):
         logger.warning(f"Ensemble loading failed: {e}")
         logger.info("Attempting fallback manual loading...")
 
-        state = torch.load(checkpoint_path, map_location="cpu")
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         cfg = OmegaConf.create(state["cfg"])
 
         cfg.task.data = manifest_dir
         cfg.task.label_dir = manifest_dir
         cfg.model.w2v_path = w2v_path
+        cfg.model.stage1_checkpoint = "???"
+        cfg.model.vocoder_checkpoint = "???"
 
         from src.task_synthvc import MMS_LLaMA_TrainingSynthVCTask
         task = MMS_LLaMA_TrainingSynthVCTask.setup_task(cfg.task)
