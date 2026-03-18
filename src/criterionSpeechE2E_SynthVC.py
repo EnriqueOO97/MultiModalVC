@@ -46,6 +46,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self.conv_loss_weight = conv_loss_weight
         self.disc_start_updates = disc_start_updates
         self._num_updates = 0
+        self._phase2_frozen = False
         logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}, "
                      f"disc_start_updates={self.disc_start_updates}")
 
@@ -99,6 +100,11 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
         # Determine if disc is active
         disc_active = self._is_disc_active(model)
+
+        # Freeze upstream modules the first time Phase 2 activates
+        if disc_active and not self._phase2_frozen:
+            model._freeze_for_phase2()
+            self._phase2_frozen = True
 
         # =====================================================================
         # Phase 2 Validation Optimization

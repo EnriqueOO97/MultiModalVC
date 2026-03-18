@@ -418,12 +418,15 @@ class mms_synthvc_dataset(FairseqDataset):
         batch['spk_embeddings'] = torch.stack(spk_embeddings)  # (B, 512)
 
         # === SynthVC-specific: synthetic audio ===
-        synth_sources = [s["synth_audio_source"] for s in samples]
-        if synth_sources[0] is not None:
-            batch['synth_audio'] = self.collater_whisper_input(synth_sources)  # (B, 80, T_whisper)
-            batch['synth_audio_lengths'] = torch.tensor(
-                [s["synth_audio_len_samples"] for s in samples], dtype=torch.long
-            )
+        # Only include synth_audio for training and valid_synth subsets.
+        # Canonical validation (subset 'valid') must NOT have access to synthetic data.
+        if self.subset_name != 'valid':
+            synth_sources = [s["synth_audio_source"] for s in samples]
+            if synth_sources[0] is not None:
+                batch['synth_audio'] = self.collater_whisper_input(synth_sources)  # (B, 80, T_whisper)
+                batch['synth_audio_lengths'] = torch.tensor(
+                    [s["synth_audio_len_samples"] for s in samples], dtype=torch.long
+                )
 
         return batch
 

@@ -179,6 +179,16 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
             logger.warning(f"[E2E Model] Unexpected vocoder keys: {unexpected}")
         logger.info("[E2E Model] Vocoder weights loaded successfully")
 
+    def _freeze_for_phase2(self):
+        """Freeze everything except vocoder and discriminators for Phase 2 adversarial training.
+        Called once by the criterion when disc_active first becomes True."""
+        vocoder_disc_prefixes = ("vocoder_", "mpd.", "msd.")
+        for name, param in self.named_parameters():
+            if not any(name.startswith(p) for p in vocoder_disc_prefixes):
+                param.requires_grad = False
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(f"[E2E Model] Phase 2 freeze: only vocoder + discriminators trainable ({trainable:,} params)")
+
     def _freeze_stage1(self):
         """Freeze Stage 1 components (proj1, proj2, conformer, ln layers, Q-Former, etc).
         Keeps vocoder upsampling trainable."""
