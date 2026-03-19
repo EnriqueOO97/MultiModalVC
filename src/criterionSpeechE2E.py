@@ -88,26 +88,36 @@ class E2EGanLossConfig(FairseqDataclass):
     disc_betas: str = field(
         default="0.8,0.99", metadata={"help": "Discriminator Adam betas (comma-separated)"}
     )
+    mel_num_mels: int = field(
+        default=128, metadata={"help": "Number of mel filter banks"}
+    )
+    mel_hop_size: int = field(
+        default=160, metadata={"help": "Mel spectrogram hop size in samples (160=100Hz, 320=50Hz at 16kHz)"}
+    )
 
 
 @register_criterion("e2e_gan_loss", dataclass=E2EGanLossConfig)
 class E2EGanLoss(FairseqCriterion):
-    def __init__(self, task, mel_loss_weight=45.0, use_discriminator=True, disc_lr=2e-4, disc_betas="0.8,0.99"):
+    def __init__(self, task, mel_loss_weight=45.0, use_discriminator=True, disc_lr=2e-4, disc_betas="0.8,0.99",
+                 mel_num_mels=128, mel_hop_size=160):
         super().__init__(task)
         self.mel_loss_weight = mel_loss_weight
         self.use_discriminator = use_discriminator
         self.disc_lr = disc_lr
         self.disc_betas = tuple(float(x) for x in disc_betas.split(","))
-        
+        self.mel_num_mels = mel_num_mels
+        self.mel_hop_size = mel_hop_size
+
         self.logmel = None  # Lazy init on first forward (needs device)
         self.disc_optimizer = None  # Lazy init (needs model reference)
-        
-        logger.info(f"[E2E Criterion] use_discriminator={self.use_discriminator}")
+
+        logger.info(f"[E2E Criterion] use_discriminator={self.use_discriminator}, "
+                    f"mel_num_mels={self.mel_num_mels}, mel_hop_size={self.mel_hop_size}")
     
     def _lazy_init(self, model, device):
         """Initialize LogMelSpectrogram and discriminator optimizer on first call."""
         if self.logmel is None:
-            self.logmel = LogMelSpectrogram().to(device)
+            self.logmel = LogMelSpectrogram(num_mels=self.mel_num_mels, hop_size=self.mel_hop_size).to(device)
         
         if self.disc_optimizer is None and self.use_discriminator:
             # Collect discriminator params - enable grad for optimizer

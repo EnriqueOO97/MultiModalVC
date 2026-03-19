@@ -41,13 +41,15 @@ class E2EGanLossSynthVCConfig(E2EGanLossConfig):
 class E2EGanLossSynthVC(E2EGanLoss):
     def __init__(self, task, mel_loss_weight=40.0, use_discriminator=True,
                  disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0,
-                 disc_start_updates=30000):
-        super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas)
+                 disc_start_updates=30000, mel_num_mels=128, mel_hop_size=160):
+        super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas,
+                         mel_num_mels=mel_num_mels, mel_hop_size=mel_hop_size)
         self.conv_loss_weight = conv_loss_weight
         self.disc_start_updates = disc_start_updates
         self._num_updates = 0
         logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}, "
-                     f"disc_start_updates={self.disc_start_updates}")
+                     f"disc_start_updates={self.disc_start_updates}, "
+                     f"mel_num_mels={mel_num_mels}, mel_hop_size={mel_hop_size}")
 
     def _is_disc_active(self, model=None):
         """Determine if the discriminator phase is active."""
