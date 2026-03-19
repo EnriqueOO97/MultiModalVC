@@ -46,7 +46,6 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self.conv_loss_weight = conv_loss_weight
         self.disc_start_updates = disc_start_updates
         self._num_updates = 0
-        self._phase2_frozen = False
         logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}, "
                      f"disc_start_updates={self.disc_start_updates}")
 
@@ -102,9 +101,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
         disc_active = self._is_disc_active(model)
 
         # Freeze upstream modules the first time Phase 2 activates
-        if disc_active and not self._phase2_frozen:
+        if disc_active:
             model._freeze_for_phase2()
-            self._phase2_frozen = True
 
         # =====================================================================
         # Phase 2 Validation Optimization
@@ -289,6 +287,30 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     canonical_features[:, :min_t, :].detach()
                 )
 
+            loss_fm = torch.tensor(0.0, device=pred_wav.device)
+            loss_gen_adv = torch.tensor(0.0, device=pred_wav.device)
+            loss_disc = torch.tensor(0.0, device=pred_wav.device)
+
+            if disc_active and subset_name == 'valid_synth':
+                import sys
+                import os
+                sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan"))
+                from hifigan.discriminator import feature_loss, discriminator_loss, generator_loss
+                with torch.no_grad():
+                    mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
+                    msd_real_scores, msd_real_feats = model.msd(gt_wav)
+                    mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
+                    msd_fake_scores, msd_fake_feats = model.msd(pred_wav)
+
+                    loss_fm = feature_loss(mpd_real_feats, mpd_fake_feats) + feature_loss(msd_real_feats, msd_fake_feats)
+                    loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
+                    loss_gen_msd, _ = generator_loss(msd_fake_scores)
+                    loss_gen_adv = loss_gen_mpd + loss_gen_msd
+
+                    loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
+                    loss_disc_msd, _, _ = discriminator_loss(msd_real_scores, msd_fake_scores)
+                    loss_disc = loss_disc_mpd + loss_disc_msd
+
             loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv
 
             logging_output = {
@@ -297,9 +319,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 "loss_conv": loss_conv.item(),
                 "loss_mel_weighted": (self.mel_loss_weight * loss_mel).item(),
                 "loss_conv_weighted": (self.conv_loss_weight * loss_conv).item(),
-                "loss_fm": 0.0,
-                "loss_gen_adv": 0.0,
-                "loss_disc": 0.0,
+                "loss_fm": loss_fm.item(),
+                "loss_gen_adv": loss_gen_adv.item(),
+                "loss_disc": loss_disc.item(),
                 "disc_active": 1 if disc_active else 0,
                 "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                 "sample_size": B,
