@@ -83,32 +83,38 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         # Create full generator first, then we'll load weights and extract components
         self._full_vocoder = HifiganGenerator()
         
-        # Load pretrained HiFi-GAN weights
+        # Load pretrained HiFi-GAN weights (generator + stash disc state for later)
+        self._pending_disc_state = None
         if cfg.vocoder_checkpoint and cfg.vocoder_checkpoint != "???":
             self._load_vocoder_weights(cfg.vocoder_checkpoint)
-        
+
         # Extract all vocoder components
         self.vocoder_ups = self._full_vocoder.ups
         self.vocoder_resblocks = self._full_vocoder.resblocks
         self.vocoder_conv_post = self._full_vocoder.conv_post
         self.vocoder_num_kernels = self._full_vocoder.num_kernels
         self.vocoder_num_upsamples = self._full_vocoder.num_upsamples
-        
+
         # Adapter conv_pre: 512→512 (replaces original 128→512)
         # This bridges the conformer output distribution to what vocoder upsampling expects
         from torch.nn.utils import weight_norm
         self.vocoder_conv_pre = weight_norm(
             nn.Conv1d(512, 512, 7, 1, padding=3)
         )
-        
+
         # We don't need the full vocoder anymore — components are extracted
         del self._full_vocoder
-        
+
         # =====================================================================
         # HiFi-GAN Discriminator
         # =====================================================================
         self.mpd = MultiPeriodDiscriminator()
         self.msd = MultiScaleDiscriminator()
+
+        # Load pretrained disc weights (stashed during _load_vocoder_weights)
+        if self._pending_disc_state is not None:
+            self._load_disc_weights(self._pending_disc_state)
+            self._pending_disc_state = None
         
         # Freeze discriminator from fairseq's optimizer — it has its own
         for param in self.mpd.parameters():
@@ -158,7 +164,7 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         logger.info("[E2E Model] Stage 1 weights loaded successfully")
 
     def _load_vocoder_weights(self, checkpoint_path):
-        """Load pretrained HiFi-GAN generator + discriminator weights."""
+        """Load pretrained HiFi-GAN generator weights and stash disc state for later."""
         logger.info(f"[E2E Model] Loading vocoder weights from {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
@@ -183,37 +189,31 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
             logger.warning(f"[E2E Model] Unexpected vocoder keys: {unexpected}")
         logger.info("[E2E Model] Vocoder weights loaded successfully")
 
-        # Load discriminator weights if available
-        # Checkpoint stores HifiganDiscriminator.state_dict() with keys like
-        # "mpd.discriminators.0.convs..." and "msd.discriminators.0.convs..."
-        disc_state = None
+        # Stash discriminator state for loading after self.mpd/self.msd are created
         if "discriminator" in state and "model" in state["discriminator"]:
-            disc_state = state["discriminator"]["model"]
+            self._pending_disc_state = state["discriminator"]["model"]
         elif "discriminator" in state and isinstance(state["discriminator"], dict):
-            # Check if it's directly the state dict (no nested "model" key)
             if any(k.startswith("mpd.") or k.startswith("msd.") for k in state["discriminator"]):
-                disc_state = state["discriminator"]
+                self._pending_disc_state = state["discriminator"]
 
-        if disc_state is not None:
-            # Split by prefix: mpd.* → self.mpd, msd.* → self.msd
-            mpd_state = {k[len("mpd."):]: v for k, v in disc_state.items() if k.startswith("mpd.")}
-            msd_state = {k[len("msd."):]: v for k, v in disc_state.items() if k.startswith("msd.")}
+    def _load_disc_weights(self, disc_state):
+        """Load pretrained discriminator weights into self.mpd and self.msd."""
+        mpd_state = {k[len("mpd."):]: v for k, v in disc_state.items() if k.startswith("mpd.")}
+        msd_state = {k[len("msd."):]: v for k, v in disc_state.items() if k.startswith("msd.")}
 
-            if mpd_state:
-                missing_mpd, unexpected_mpd = self.mpd.load_state_dict(mpd_state, strict=False)
-                if missing_mpd:
-                    logger.warning(f"[E2E Model] Missing MPD keys: {missing_mpd}")
-                if unexpected_mpd:
-                    logger.warning(f"[E2E Model] Unexpected MPD keys: {unexpected_mpd}")
-            if msd_state:
-                missing_msd, unexpected_msd = self.msd.load_state_dict(msd_state, strict=False)
-                if missing_msd:
-                    logger.warning(f"[E2E Model] Missing MSD keys: {missing_msd}")
-                if unexpected_msd:
-                    logger.warning(f"[E2E Model] Unexpected MSD keys: {unexpected_msd}")
-            logger.info(f"[E2E Model] Discriminator weights loaded (MPD: {len(mpd_state)} params, MSD: {len(msd_state)} params)")
-        else:
-            logger.info("[E2E Model] No discriminator weights found in checkpoint — using random init")
+        if mpd_state:
+            missing_mpd, unexpected_mpd = self.mpd.load_state_dict(mpd_state, strict=False)
+            if missing_mpd:
+                logger.warning(f"[E2E Model] Missing MPD keys: {missing_mpd}")
+            if unexpected_mpd:
+                logger.warning(f"[E2E Model] Unexpected MPD keys: {unexpected_mpd}")
+        if msd_state:
+            missing_msd, unexpected_msd = self.msd.load_state_dict(msd_state, strict=False)
+            if missing_msd:
+                logger.warning(f"[E2E Model] Missing MSD keys: {missing_msd}")
+            if unexpected_msd:
+                logger.warning(f"[E2E Model] Unexpected MSD keys: {unexpected_msd}")
+        logger.info(f"[E2E Model] Discriminator weights loaded (MPD: {len(mpd_state)} params, MSD: {len(msd_state)} params)")
 
     def _freeze_for_phase2(self):
         """Freeze everything except vocoder and discriminators for Phase 2 adversarial training.
