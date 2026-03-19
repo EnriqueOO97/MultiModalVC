@@ -22,7 +22,7 @@ from fairseq import metrics
 from fairseq.criterions import register_criterion
 from fairseq.dataclass import FairseqDataclass
 
-from .criterionSpeechE2E import E2EGanLoss, E2EGanLossConfig, LogMelSpectrogram
+from .criterionSpeechE2E import E2EGanLoss, E2EGanLossConfig, LogMelSpectrogram, MultiResolutionMelLoss
 
 logger = logging.getLogger("src.criterionSpeechE2E_SynthVC")
 
@@ -35,20 +35,37 @@ class E2EGanLossSynthVCConfig(E2EGanLossConfig):
     disc_start_updates: int = field(
         default=30000, metadata={"help": "Auto-activate discriminator after this many updates"}
     )
+    disc_grad_clip: float = field(
+        default=0.0, metadata={"help": "Max gradient norm for discriminator (0 = disabled)"}
+    )
+    adv_warmup_updates: int = field(
+        default=0, metadata={"help": "Linearly ramp adversarial loss weight from 0→1 over this many updates after disc activates (0 = disabled)"}
+    )
+    use_multires_mel: bool = field(
+        default=False, metadata={"help": "Use multi-resolution mel loss (3 scales) instead of single-resolution"}
+    )
 
 
 @register_criterion("e2e_gan_loss_synthvc", dataclass=E2EGanLossSynthVCConfig)
 class E2EGanLossSynthVC(E2EGanLoss):
     def __init__(self, task, mel_loss_weight=40.0, use_discriminator=True,
                  disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0,
-                 disc_start_updates=30000, mel_num_mels=128, mel_hop_size=160):
+                 disc_start_updates=30000, mel_num_mels=128, mel_hop_size=160,
+                 disc_grad_clip=0.0, adv_warmup_updates=0, use_multires_mel=False):
         super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas,
                          mel_num_mels=mel_num_mels, mel_hop_size=mel_hop_size)
         self.conv_loss_weight = conv_loss_weight
         self.disc_start_updates = disc_start_updates
+        self.disc_grad_clip = disc_grad_clip
+        self.adv_warmup_updates = adv_warmup_updates
+        self.use_multires_mel = use_multires_mel
         self._num_updates = 0
+        self._disc_active_since = None  # track when disc phase started
+        self.multires_mel = None  # lazy init
         logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}, "
                      f"disc_start_updates={self.disc_start_updates}, "
+                     f"disc_grad_clip={self.disc_grad_clip}, adv_warmup_updates={self.adv_warmup_updates}, "
+                     f"use_multires_mel={self.use_multires_mel}, "
                      f"mel_num_mels={mel_num_mels}, mel_hop_size={mel_hop_size}")
 
     def _is_disc_active(self, model=None):
@@ -70,7 +87,11 @@ class E2EGanLossSynthVC(E2EGanLoss):
         because we might transition to disc_active=True mid-training.
         """
         if self.logmel is None:
-            self.logmel = LogMelSpectrogram().to(device)
+            self.logmel = LogMelSpectrogram(num_mels=self.mel_num_mels, hop_size=self.mel_hop_size).to(device)
+
+        if self.use_multires_mel and self.multires_mel is None:
+            self.multires_mel = MultiResolutionMelLoss(num_mels=self.mel_num_mels).to(device)
+            logger.info(f"[SynthVC Criterion] Initialized multi-resolution mel loss (3 scales, {self.mel_num_mels} bands)")
 
         if self.disc_optimizer is None:
             # Collect discriminator params - enable grad for optimizer
@@ -178,15 +199,20 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
         B = pred_wav.size(0)
 
-        with torch.no_grad():
-            mel_gt = self.logmel(gt_wav)
-        mel_pred = self.logmel(pred_wav)
+        if self.use_multires_mel and self.multires_mel is not None:
+            # Multi-resolution mel loss (3 scales averaged)
+            loss_mel, mel_pred, mel_gt = self.multires_mel(pred_wav, gt_wav)
+        else:
+            # Single-resolution mel loss
+            with torch.no_grad():
+                mel_gt = self.logmel(gt_wav)
+            mel_pred = self.logmel(pred_wav)
 
-        mel_min_len = min(mel_pred.size(-1), mel_gt.size(-1))
-        mel_pred = mel_pred[..., :mel_min_len]
-        mel_gt = mel_gt[..., :mel_min_len]
+            mel_min_len = min(mel_pred.size(-1), mel_gt.size(-1))
+            mel_pred = mel_pred[..., :mel_min_len]
+            mel_gt = mel_gt[..., :mel_min_len]
 
-        loss_mel = F.l1_loss(mel_pred, mel_gt)
+            loss_mel = F.l1_loss(mel_pred, mel_gt)
 
         # =====================================================================
         # Training: Phase-aware loss computation
@@ -205,6 +231,11 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan"))
                 from hifigan.discriminator import feature_loss, discriminator_loss, generator_loss
 
+                # Track when disc phase started (for warmup)
+                if self._disc_active_since is None:
+                    self._disc_active_since = self._num_updates
+                    logger.info(f"[SynthVC Criterion] Disc phase started at update {self._num_updates}")
+
                 # Discriminator step
                 self.disc_optimizer.zero_grad()
                 mpd_real_scores, _ = model.mpd(gt_wav)
@@ -216,6 +247,12 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 loss_disc_msd, _, _ = discriminator_loss(msd_real_scores, msd_fake_scores)
                 loss_disc = loss_disc_mpd + loss_disc_msd
                 loss_disc.backward()
+
+                # Gradient clipping for discriminator
+                if self.disc_grad_clip > 0:
+                    disc_params = list(model.mpd.parameters()) + list(model.msd.parameters())
+                    torch.nn.utils.clip_grad_norm_(disc_params, self.disc_grad_clip)
+
                 self.disc_optimizer.step()
 
                 # Generator step
@@ -229,8 +266,14 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 loss_gen_msd, _ = generator_loss(msd_fake_scores)
                 loss_gen_adv = loss_gen_mpd + loss_gen_msd
 
+                # Adversarial warmup: linearly ramp adv weight from 0→1
+                adv_weight = 1.0
+                if self.adv_warmup_updates > 0:
+                    steps_since_disc = self._num_updates - self._disc_active_since
+                    adv_weight = min(1.0, steps_since_disc / self.adv_warmup_updates)
+
                 loss_gen = (self.mel_loss_weight * loss_mel
-                            + loss_fm + loss_gen_adv)
+                            + adv_weight * (loss_fm + loss_gen_adv))
 
                 logging_output = {
                     "loss": loss_gen.item(),
@@ -241,6 +284,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss_fm": loss_fm.item(),
                     "loss_gen_adv": loss_gen_adv.item(),
                     "loss_disc": loss_disc.item(),
+                    "adv_weight": adv_weight,
                     "disc_active": 1,
                     "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                     "sample_size": B,
@@ -346,6 +390,21 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
             return loss_gen, B, logging_output
 
+    def state_dict(self):
+        """Save disc_active_since for warmup resume."""
+        state = super().state_dict()
+        if self._disc_active_since is not None:
+            state["disc_active_since"] = self._disc_active_since
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Restore disc_active_since for warmup resume."""
+        disc_active_since = state_dict.pop("disc_active_since", None)
+        super().load_state_dict(state_dict, strict)
+        if disc_active_since is not None:
+            self._disc_active_since = disc_active_since
+            logger.info(f"[SynthVC Criterion] Restored _disc_active_since={self._disc_active_since}")
+
     @staticmethod
     def reduce_metrics(logging_outputs) -> None:
         n_batches = len(logging_outputs)
@@ -366,6 +425,10 @@ class E2EGanLossSynthVC(E2EGanLoss):
         num_updates_vals = [log.get("num_updates", 0) for log in logging_outputs]
         if num_updates_vals:
             metrics.log_scalar("criterion_updates", max(num_updates_vals), priority=84, round=0)
+
+        adv_weight_vals = [log.get("adv_weight", -1) for log in logging_outputs if log.get("adv_weight", -1) >= 0]
+        if adv_weight_vals:
+            metrics.log_scalar("adv_weight", sum(adv_weight_vals) / len(adv_weight_vals), priority=83, round=4)
 
         for key, priority in [("mcd", 80), ("ssim", 70), ("val_mel_loss", 60)]:
             values = [log[key] for log in logging_outputs if key in log]

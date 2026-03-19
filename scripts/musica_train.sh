@@ -116,6 +116,9 @@ else
         criterion.mel_loss_weight=${MEL_LOSS_WEIGHT:-1.0} \
         criterion.conv_loss_weight=${CONV_LOSS_WEIGHT:-10.0} \
         criterion.disc_start_updates=${DISC_START_UPDATES:-120000} \
+        criterion.mel_num_mels=${MEL_NUM_MELS:-128} \
+        criterion.mel_hop_size=${MEL_HOP_SIZE:-160} \
+        model.mel_hop_size=${MEL_HOP_SIZE:-160} \
         optimization.update_freq=[2] \
         optimization.lr=[2e-4] \
         optimizer._name=adam \

@@ -60,6 +60,11 @@ criterion:
   disc_start_updates: 30000
   disc_lr: 2e-4
   disc_betas: "0.8,0.99"
+  mel_num_mels: 128
+  mel_hop_size: 160
+  disc_grad_clip: 0.0
+  adv_warmup_updates: 0
+  use_multires_mel: false
 
 optimization:
   max_epoch: 200
@@ -126,6 +131,7 @@ model:
   stage1_checkpoint: ???
   vocoder_checkpoint: ???
   freeze_stage1: true
+  mel_hop_size: 160
   
   normalize: true
 

@@ -158,10 +158,10 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         logger.info("[E2E Model] Stage 1 weights loaded successfully")
 
     def _load_vocoder_weights(self, checkpoint_path):
-        """Load pretrained HiFi-GAN generator weights."""
+        """Load pretrained HiFi-GAN generator + discriminator weights."""
         logger.info(f"[E2E Model] Loading vocoder weights from {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        
+
         # Handle different checkpoint formats
         if "generator" in state and "model" in state["generator"]:
             # trainGermanVocoder.py format
@@ -174,7 +174,7 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
             gen_state = state["generator"]
         else:
             gen_state = state
-        
+
         # Load into full vocoder
         missing, unexpected = self._full_vocoder.load_state_dict(gen_state, strict=False)
         if missing:
@@ -182,6 +182,38 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         if unexpected:
             logger.warning(f"[E2E Model] Unexpected vocoder keys: {unexpected}")
         logger.info("[E2E Model] Vocoder weights loaded successfully")
+
+        # Load discriminator weights if available
+        # Checkpoint stores HifiganDiscriminator.state_dict() with keys like
+        # "mpd.discriminators.0.convs..." and "msd.discriminators.0.convs..."
+        disc_state = None
+        if "discriminator" in state and "model" in state["discriminator"]:
+            disc_state = state["discriminator"]["model"]
+        elif "discriminator" in state and isinstance(state["discriminator"], dict):
+            # Check if it's directly the state dict (no nested "model" key)
+            if any(k.startswith("mpd.") or k.startswith("msd.") for k in state["discriminator"]):
+                disc_state = state["discriminator"]
+
+        if disc_state is not None:
+            # Split by prefix: mpd.* → self.mpd, msd.* → self.msd
+            mpd_state = {k[len("mpd."):]: v for k, v in disc_state.items() if k.startswith("mpd.")}
+            msd_state = {k[len("msd."):]: v for k, v in disc_state.items() if k.startswith("msd.")}
+
+            if mpd_state:
+                missing_mpd, unexpected_mpd = self.mpd.load_state_dict(mpd_state, strict=False)
+                if missing_mpd:
+                    logger.warning(f"[E2E Model] Missing MPD keys: {missing_mpd}")
+                if unexpected_mpd:
+                    logger.warning(f"[E2E Model] Unexpected MPD keys: {unexpected_mpd}")
+            if msd_state:
+                missing_msd, unexpected_msd = self.msd.load_state_dict(msd_state, strict=False)
+                if missing_msd:
+                    logger.warning(f"[E2E Model] Missing MSD keys: {missing_msd}")
+                if unexpected_msd:
+                    logger.warning(f"[E2E Model] Unexpected MSD keys: {unexpected_msd}")
+            logger.info(f"[E2E Model] Discriminator weights loaded (MPD: {len(mpd_state)} params, MSD: {len(msd_state)} params)")
+        else:
+            logger.info("[E2E Model] No discriminator weights found in checkpoint — using random init")
 
     def _freeze_for_phase2(self):
         """Freeze everything except vocoder and discriminators for Phase 2 adversarial training.

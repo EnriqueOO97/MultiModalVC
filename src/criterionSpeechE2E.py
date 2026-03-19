@@ -74,6 +74,53 @@ class LogMelSpectrogram(nn.Module):
         return logmel
 
 
+class MultiResolutionMelLoss(nn.Module):
+    """Compute mel L1 loss at multiple (n_fft, hop_size) resolutions.
+
+    Default resolutions follow BigVGAN / EnCodec conventions adapted for 16kHz.
+    Returns the average L1 across all resolutions.
+    """
+    def __init__(self, resolutions=None, num_mels=80, sample_rate=16000):
+        super().__init__()
+        if resolutions is None:
+            # (n_fft, hop_size, win_size) — covers fine, medium, and coarse scales
+            resolutions = [
+                (512, 120, 512),
+                (1024, 160, 1024),
+                (2048, 480, 2048),
+            ]
+        self.logmels = nn.ModuleList([
+            LogMelSpectrogram(n_fft=n, num_mels=num_mels, hop_size=h, win_size=w, sample_rate=sample_rate)
+            for n, h, w in resolutions
+        ])
+
+    def forward(self, pred_wav, gt_wav):
+        """
+        Args:
+            pred_wav: (B, 1, T) predicted waveform (graph attached)
+            gt_wav:   (B, 1, T) ground-truth waveform
+        Returns:
+            loss: scalar, average L1 across resolutions
+            mel_pred_primary: mel from the second (primary) resolution, for logging/metrics
+            mel_gt_primary: corresponding ground-truth mel
+        """
+        total_loss = 0.0
+        mel_pred_primary = mel_gt_primary = None
+        for i, logmel in enumerate(self.logmels):
+            with torch.no_grad():
+                mg = logmel(gt_wav)
+            mp = logmel(pred_wav)
+            min_t = min(mp.size(-1), mg.size(-1))
+            mp = mp[..., :min_t]
+            mg = mg[..., :min_t]
+            total_loss = total_loss + F.l1_loss(mp, mg)
+            # Keep the middle resolution for MCD/SSIM metrics
+            if i == 1:
+                mel_pred_primary = mp
+                mel_gt_primary = mg
+        return total_loss / len(self.logmels), mel_pred_primary, mel_gt_primary
+
+
 @dataclass
 class E2EGanLossConfig(FairseqDataclass):
     mel_loss_weight: float = field(
