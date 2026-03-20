@@ -116,12 +116,11 @@ else
         criterion.mel_loss_weight=${MEL_LOSS_WEIGHT:-1.0} \
         criterion.conv_loss_weight=${CONV_LOSS_WEIGHT:-10.0} \
         criterion.disc_start_updates=${DISC_START_UPDATES:-120000} \
-        criterion.mel_num_mels=${MEL_NUM_MELS:-128} \
-        criterion.mel_hop_size=${MEL_HOP_SIZE:-160} \
+        criterion.mel_num_mels=${MEL_NUM_MELS:-80} \
+        criterion.mel_hop_size=${MEL_HOP_SIZE:-320} \
         criterion.disc_grad_clip=${DISC_GRAD_CLIP:-5.0} \
         criterion.adv_warmup_updates=${ADV_WARMUP_UPDATES:-5000} \
-        criterion.use_multires_mel=${USE_MULTIRES_MEL:-false} \
-        model.mel_hop_size=${MEL_HOP_SIZE:-160} \
+        criterion.use_multires_mel=${USE_MULTIRES_MEL:-true} \
         optimization.update_freq=[2] \
         optimization.clip_norm=${CLIP_NORM:-1.0} \
         optimization.lr=[2e-4] \

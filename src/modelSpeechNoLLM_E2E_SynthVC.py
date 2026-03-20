@@ -321,7 +321,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
             raise ValueError("Audio lengths required for speech interpolation.")
 
         n_fft = 1024
-        hop_length = self.cfg.mel_hop_size
+        hop_length = 160  # Fixed: must match vocoder upsample factor (10*4*2*2=160)
         pad = (n_fft - hop_length) // 2
         audio_lengths = audio_lengths.to(dtype=torch.long)
         target_lengths = torch.div(audio_lengths + 2 * pad - n_fft, hop_length, rounding_mode='floor') + 1

@@ -131,7 +131,6 @@ model:
   stage1_checkpoint: ???
   vocoder_checkpoint: ???
   freeze_stage1: true
-  mel_hop_size: 160
   
   normalize: true
 

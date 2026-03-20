@@ -148,9 +148,14 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 "sample_size": B,
                 "nsentences": B,
                 "val_mel_loss": 0.0,
-                "mcd": 0.0,
-                "ssim": 0.0,
             }
+            if self.use_multires_mel:
+                for name in ["fine", "medium", "coarse"]:
+                    logging_output[f"mcd_{name}"] = 0.0
+                    logging_output[f"ssim_{name}"] = 0.0
+            else:
+                logging_output["mcd"] = 0.0
+                logging_output["ssim"] = 0.0
             device = next(model.parameters()).device
             return torch.tensor(0.0, device=device), B, logging_output
 
@@ -376,16 +381,37 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
             from .criterionSpeech import compute_mcd, compute_ssim
             with torch.no_grad():
-                mel_pred_bt = mel_pred.transpose(1, 2).float()
-                mel_gt_bt = mel_gt.transpose(1, 2).float()
-                try:
-                    logging_output["mcd"] = compute_mcd(mel_pred_bt, mel_gt_bt).item()
-                except Exception:
-                    logging_output["mcd"] = 0.0
-                try:
-                    logging_output["ssim"] = compute_ssim(mel_pred_bt, mel_gt_bt).item()
-                except Exception:
-                    logging_output["ssim"] = 0.0
+                if self.use_multires_mel and self.multires_mel is not None:
+                    # Per-scale validation: compute SSIM/MCD at each of the 3 resolutions
+                    scale_names = ["fine", "medium", "coarse"]
+                    for logmel_fn, name in zip(self.multires_mel.logmels, scale_names):
+                        mp = logmel_fn(pred_wav)
+                        mg = logmel_fn(gt_wav)
+                        min_t = min(mp.size(-1), mg.size(-1))
+                        mp = mp[..., :min_t]
+                        mg = mg[..., :min_t]
+                        mp_bt = mp.transpose(1, 2).float()
+                        mg_bt = mg.transpose(1, 2).float()
+                        try:
+                            logging_output[f"mcd_{name}"] = compute_mcd(mp_bt, mg_bt).item()
+                        except Exception:
+                            logging_output[f"mcd_{name}"] = 0.0
+                        try:
+                            logging_output[f"ssim_{name}"] = compute_ssim(mp_bt, mg_bt).item()
+                        except Exception:
+                            logging_output[f"ssim_{name}"] = 0.0
+                else:
+                    # Single-resolution validation
+                    mel_pred_bt = mel_pred.transpose(1, 2).float()
+                    mel_gt_bt = mel_gt.transpose(1, 2).float()
+                    try:
+                        logging_output["mcd"] = compute_mcd(mel_pred_bt, mel_gt_bt).item()
+                    except Exception:
+                        logging_output["mcd"] = 0.0
+                    try:
+                        logging_output["ssim"] = compute_ssim(mel_pred_bt, mel_gt_bt).item()
+                    except Exception:
+                        logging_output["ssim"] = 0.0
                 logging_output["val_mel_loss"] = loss_mel.item()
 
             return loss_gen, B, logging_output
@@ -430,10 +456,19 @@ class E2EGanLossSynthVC(E2EGanLoss):
         if adv_weight_vals:
             metrics.log_scalar("adv_weight", sum(adv_weight_vals) / len(adv_weight_vals), priority=83, round=4)
 
+        # Single-res metrics
         for key, priority in [("mcd", 80), ("ssim", 70), ("val_mel_loss", 60)]:
             values = [log[key] for log in logging_outputs if key in log]
             if values:
                 metrics.log_scalar(key, sum(values) / len(values), priority=priority, round=4)
+
+        # Multi-res per-scale metrics
+        for scale in ["fine", "medium", "coarse"]:
+            for key_base, priority in [("mcd", 79), ("ssim", 69)]:
+                key = f"{key_base}_{scale}"
+                values = [log[key] for log in logging_outputs if key in log]
+                if values:
+                    metrics.log_scalar(key, sum(values) / len(values), priority=priority, round=4)
 
     @staticmethod
     def logging_outputs_can_be_summed() -> bool:

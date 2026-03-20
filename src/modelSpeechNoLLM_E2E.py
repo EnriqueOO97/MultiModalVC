@@ -44,10 +44,6 @@ class MMS_Speech_NoLLM_E2E_Config(MMS_Speech_NoLLM_Config):
     freeze_stage1: bool = field(
         default=True, metadata={"help": "Whether to freeze Stage 1 components initially"}
     )
-    # Mel spectrogram hop size — must match criterion.mel_hop_size
-    mel_hop_size: int = field(
-        default=160, metadata={"help": "Mel hop size in samples, used to compute target frame lengths (160=100Hz, 320=50Hz at 16kHz)"}
-    )
 
 
 @register_model("MMS_Speech_NoLLM_E2E", dataclass=MMS_Speech_NoLLM_E2E_Config)
