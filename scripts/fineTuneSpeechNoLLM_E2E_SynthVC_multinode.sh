@@ -142,6 +142,7 @@ else
         model.mel_hop_size=${MEL_HOP_SIZE:-160} \
         optimization.update_freq=[4] \
         optimization.lr=[2e-4] \
+        optimization.clip_norm=${CLIP_NORM:-1.0} \
         optimizer._name=adam \
         +optimizer.weight_decay=0.01 \
         optimization.max_update=600000 \

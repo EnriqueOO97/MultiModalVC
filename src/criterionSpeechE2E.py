@@ -100,7 +100,7 @@ class MultiResolutionMelLoss(nn.Module):
             pred_wav: (B, 1, T) predicted waveform (graph attached)
             gt_wav:   (B, 1, T) ground-truth waveform
         Returns:
-            loss: scalar, sum of L1 across resolutions (not averaged)
+            loss: scalar, mean of L1 across resolutions
             mel_pred_primary: mel from the second (primary) resolution, for logging/metrics
             mel_gt_primary: corresponding ground-truth mel
         """
@@ -118,7 +118,7 @@ class MultiResolutionMelLoss(nn.Module):
             if i == 1:
                 mel_pred_primary = mp
                 mel_gt_primary = mg
-        return total_loss, mel_pred_primary, mel_gt_primary
+        return total_loss / len(self.logmels), mel_pred_primary, mel_gt_primary
 
 
 @dataclass

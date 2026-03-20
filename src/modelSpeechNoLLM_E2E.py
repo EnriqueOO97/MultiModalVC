@@ -218,12 +218,15 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
     def _freeze_for_phase2(self):
         """Freeze everything except vocoder and discriminators for Phase 2 adversarial training.
         Called once by the criterion when disc_active first becomes True."""
+        if getattr(self, "_phase2_frozen", False):
+            return
         vocoder_disc_prefixes = ("vocoder_", "mpd.", "msd.")
         for name, param in self.named_parameters():
             if not any(name.startswith(p) for p in vocoder_disc_prefixes):
                 param.requires_grad = False
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(f"[E2E Model] Phase 2 freeze: only vocoder + discriminators trainable ({trainable:,} params)")
+        self._phase2_frozen = True
 
     def _freeze_stage1(self):
         """Freeze Stage 1 components (proj1, proj2, conformer, ln layers, Q-Former, etc).
