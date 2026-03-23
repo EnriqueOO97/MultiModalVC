@@ -11,8 +11,15 @@ import os
 import sys
 import argparse
 import logging
+import random
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+import torchaudio.transforms as T
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 from scipy.io import wavfile
@@ -154,6 +161,93 @@ def load_model(checkpoint_path, manifest_dir, device):
     return model
 
 
+# ---------------------------------------------------------------------------
+# Multi-resolution mel spectrogram — exact same scales as MultiResolutionMelLoss
+# in criterionSpeechE2E.py: (n_fft, hop_size, win_size) × num_mels=80
+# ---------------------------------------------------------------------------
+MEL_RESOLUTIONS = [
+    ("fine",   512,  120,  512),
+    ("medium", 1024, 160, 1024),
+    ("coarse", 2048, 480, 2048),
+]
+MEL_NUM_MELS   = 80
+MEL_SAMPLE_RATE = 16000
+
+
+def _build_logmel(n_fft, hop_size, win_size):
+    """Build a log-mel transform matching LogMelSpectrogram in criterionSpeechE2E.py."""
+    mel = T.MelSpectrogram(
+        sample_rate=MEL_SAMPLE_RATE,
+        n_fft=n_fft,
+        win_length=win_size,
+        hop_length=hop_size,
+        center=False,
+        power=2.0,
+        norm=None,
+        f_min=0,
+        f_max=8000,
+        onesided=True,
+        n_mels=MEL_NUM_MELS,
+        mel_scale="slaney",
+    )
+    return mel
+
+
+def wav_to_multires_mels(wav_np, device):
+    """Compute fine/medium/coarse log-mel tensors from a float32 numpy waveform.
+
+    Args:
+        wav_np: 1-D float32 numpy array in [-1, 1]
+        device:  torch device
+
+    Returns:
+        dict with keys "fine", "medium", "coarse", each a (num_mels, T) float32 tensor on CPU.
+    """
+    wav = torch.from_numpy(wav_np).float().unsqueeze(0)  # (1, T)
+    mels = {}
+    for name, n_fft, hop_size, win_size in MEL_RESOLUTIONS:
+        logmel_fn = _build_logmel(n_fft, hop_size, win_size)
+        pad = (n_fft - hop_size) // 2
+        wav_padded = F.pad(wav, (pad, pad), "reflect")
+        mel = logmel_fn(wav_padded)                      # (1, num_mels, T_mel)
+        logmel = torch.log(torch.clamp(mel, min=1e-5))   # (1, num_mels, T_mel)
+        mels[name] = logmel[0].cpu()                     # (num_mels, T_mel)
+    return mels
+
+
+def save_mel_pair_pngs(canon_mels, syn_mels, syn_idx, sample_id, output_dir):
+    """Save one paired PNG per resolution scale (canon on top, synth on bottom).
+
+    Output file names:  mel_fine_{ID}.png / mel_medium_{ID}.png / mel_coarse_{ID}.png
+    """
+    for name in ("fine", "medium", "coarse"):
+        canon = canon_mels[name].numpy()   # (num_mels, T_canon)
+        synth  = syn_mels[name].numpy()    # (num_mels, T_synth)
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 5))
+
+        for ax, data, title in zip(
+            axes,
+            [canon, synth],
+            [f"Canonical  —  {sample_id}",
+             f"Synthetic {syn_idx}  —  {sample_id}"],
+        ):
+            im = ax.imshow(data, aspect="auto", origin="lower",
+                           interpolation="nearest", cmap="magma")
+            ax.set_title(title, fontsize=9)
+            ax.set_ylabel("Mel band")
+            ax.set_xlabel("Frame")
+            plt.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
+
+        fig.suptitle(f"Log-mel  [{name}]  —  {sample_id}", fontsize=10, y=1.01)
+        plt.tight_layout()
+
+        out_path = os.path.join(output_dir, f"mel_{name}_{sample_id}.png")
+        plt.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        logger.debug(f"Saved {os.path.basename(out_path)}")
+
+
 def process_audio(audio_path, processor, device):
     """Load a WAV file and convert to Whisper input features."""
     sample_rate, wav_data = wavfile.read(audio_path)
@@ -228,6 +322,9 @@ def run_inference(args):
             logger.warning(f"Skipping {sample_id}: spk_emb load failed — {e}")
             continue
 
+        # Pick one synthetic index (1-based) for mel generation — chosen once per entry
+        mel_syn_idx = random.randint(1, 6)
+
         # Run all 6 synthetic variants
         for syn_idx, synth_path in enumerate(synth_paths, start=1):
             out_name = f"pred_SourceSyn{syn_idx}_{sample_id}.wav"
@@ -262,6 +359,34 @@ def run_inference(args):
             wavfile.write(out_path, args.sample_rate, wav_int16)
             total_saved += 1
             logger.debug(f"Saved {out_name} | samples={len(wav_int16)}")
+
+        # -------------------------------------------------------------------
+        # Multi-resolution mel generation (once per entry)
+        # Synthetic: the randomly chosen variant (mel_syn_idx, 1-based)
+        # Canonical: the original canonical audio waveform
+        # -------------------------------------------------------------------
+        try:
+            # --- Synthetic mels ---
+            chosen_synth_path = synth_paths[mel_syn_idx - 1]
+            _, syn_wav = wavfile.read(chosen_synth_path)
+            if syn_wav.dtype == np.int16:
+                syn_wav = syn_wav / 32768.0
+            syn_wav = syn_wav.astype(np.float32)
+            syn_mels = wav_to_multires_mels(syn_wav, device)
+
+            # --- Canonical mels ---
+            _, canon_wav = wavfile.read(canon_path)
+            if canon_wav.dtype == np.int16:
+                canon_wav = canon_wav / 32768.0
+            canon_wav = canon_wav.astype(np.float32)
+            canon_mels = wav_to_multires_mels(canon_wav, device)
+
+            # --- Save paired PNGs (canon top / synth bottom, one per scale) ---
+            save_mel_pair_pngs(canon_mels, syn_mels, mel_syn_idx, sample_id,
+                               args.output_dir)
+            logger.info(f"{sample_id}: saved mel pair PNGs (Syn{mel_syn_idx} vs canonical)")
+        except Exception as e:
+            logger.warning(f"{sample_id}: mel generation failed — {e}")
 
     logger.info(f"Done. Saved {total_saved} WAV files to {args.output_dir}")
 

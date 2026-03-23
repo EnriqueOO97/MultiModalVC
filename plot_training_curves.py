@@ -131,6 +131,30 @@ def epoch_to_step(epochs):
     _idx_last = len(_epoch_arr) - 1 - _idx2
     return np.interp(epochs, _epoch_arr[sorted(_idx_last)], _step_arr[sorted(_idx_last)])
 
+# ── Per-scale metric config ───────────────────────────────────
+SCALE_METRICS  = ['ssim', 'mcd']
+SCALES         = ['fine', 'medium', 'coarse']
+SCALE_MARKERS  = {'fine': '^', 'medium': 'o', 'coarse': 's'}
+SUBSET_COLORS  = {'valid': '#89b4fa', 'valid_synth': '#a6e3a1'}
+SCALE_TAGS     = {f"{m}_{s}" for m in SCALE_METRICS for s in SCALES}
+
+def _plot_combined_scale(metric, ax):
+    """Plot 6 curves (valid × 3 scales + valid_synth × 3 scales) on ax."""
+    for scale in SCALES:
+        tag    = f"{metric}_{scale}"
+        marker = SCALE_MARKERS[scale]
+        for run_name in ['valid', 'valid_synth']:
+            run_data = runs.get(run_name, {})
+            if tag not in run_data:
+                continue
+            steps, values = run_data[tag]
+            color  = SUBSET_COLORS[run_name]
+            label  = f"{run_name} · {scale} (last={values[-1]:.4f})"
+            every  = max(1, len(steps) // 15)
+            ax.plot(steps, values, alpha=0.9, color=color, linewidth=2,
+                    label=label, marker=marker,
+                    markevery=every, markersize=6, markeredgewidth=1.2)
+
 # ── Tag ordering (priority first) ────────────────────────────
 PRIORITY_TAGS = ['loss', 'best_loss', 'mcd', 'ssim', 'lr']
 priority_present = [t for t in PRIORITY_TAGS if t in all_tags]
@@ -142,6 +166,8 @@ ordered_tags = priority_present + other_tags
 # ==============================================================
 print(f"\n🖼  Saving cell1 plots to {cell1_dir}/")
 for tag in ordered_tags:
+    if tag in SCALE_TAGS:
+        continue  # handled as combined plot below
     fig, ax = plt.subplots(figsize=(7, 5))
     for run_name, run_data in runs.items():
         if tag not in run_data:
@@ -159,11 +185,27 @@ for tag in ordered_tags:
     plt.close(fig)
     print(f"    ✓ {tag}.png")
 
+# Combined scale plots for cell1
+for metric in SCALE_METRICS:
+    if not any(f"{metric}_{s}" in all_tags for s in SCALES):
+        continue
+    fig, ax = plt.subplots(figsize=(7, 5))
+    _plot_combined_scale(metric, ax)
+    ax.set_title(metric, fontsize=14, fontweight='bold', color='#cdd6f4')
+    ax.set_xlabel('Step')
+    ax.legend(loc='best', fontsize=8)
+    plt.tight_layout()
+    out_path = os.path.join(cell1_dir, f"{metric}.png")
+    fig.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
+    print(f"    ✓ {metric}.png (combined scales)")
+
 # ==============================================================
 # CELL 2:  Detailed individual plots for key metrics
 # ==============================================================
 KEY_METRICS = ['loss', 'mcd', 'ssim', 'best_loss', 'lr']
-key_present = [t for t in KEY_METRICS if t in all_tags]
+# Exclude scale-variant tags from individual plots; combined handled below
+key_present = [t for t in KEY_METRICS if t in all_tags and t not in SCALE_TAGS]
 
 print(f"\n🖼  Saving cell2 plots to {cell2_dir}/")
 for tag in key_present:
@@ -181,7 +223,6 @@ for tag in key_present:
     ax.set_ylabel(tag, fontsize=12)
     ax.legend(loc='best', fontsize=11)
 
-    # ── Secondary x-axis: Epoch ────────────────────────────────
     if len(_step_epoch_pairs) > 0:
         secax = ax.secondary_xaxis(-0.18, functions=(step_to_epoch, epoch_to_step))
         secax.set_xlabel('Epoch', fontsize=12, color='#f9e2af')
@@ -193,5 +234,28 @@ for tag in key_present:
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
     print(f"    ✓ {tag}.png")
+
+# Combined scale plots for cell2 (ssim.png, mcd.png — 6 curves each)
+for metric in SCALE_METRICS:
+    if not any(f"{metric}_{s}" in all_tags for s in SCALES):
+        continue
+    fig, ax = plt.subplots(figsize=(14, 5))
+    _plot_combined_scale(metric, ax)
+    ax.set_title(metric.upper(), fontsize=16, fontweight='bold', color='#f5c2e7')
+    ax.set_xlabel('Step', fontsize=12)
+    ax.set_ylabel(metric, fontsize=12)
+    ax.legend(loc='best', fontsize=10)
+
+    if len(_step_epoch_pairs) > 0:
+        secax = ax.secondary_xaxis(-0.18, functions=(step_to_epoch, epoch_to_step))
+        secax.set_xlabel('Epoch', fontsize=12, color='#f9e2af')
+        secax.tick_params(colors='#f9e2af', labelsize=10)
+        secax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
+
+    plt.tight_layout()
+    out_path = os.path.join(cell2_dir, f"{metric}.png")
+    fig.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
+    print(f"    ✓ {metric}.png (combined scales)")
 
 print("\n✅ Done!")
