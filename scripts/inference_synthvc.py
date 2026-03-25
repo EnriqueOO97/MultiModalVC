@@ -79,6 +79,13 @@ def get_parser():
         help="Path to the SynthVC model checkpoint",
     )
     parser.add_argument(
+        "--use-ema",
+        action="store_true",
+        default=False,
+        help="Load EMA weights from the checkpoint instead of raw weights. "
+             "Falls back silently to raw weights if no EMA state is found.",
+    )
+    parser.add_argument(
         "--manifest",
         type=str,
         default=os.path.join(repo_root, "manifest/germanManifest/test_inferenceAugmented.tsv"),
@@ -103,6 +110,36 @@ def get_parser():
         help="Device to use (default: cuda if available, else cpu)",
     )
     return parser
+
+
+def apply_ema_weights(model, checkpoint_path):
+    """Overwrite model weights with EMA shadow weights from the criterion state.
+
+    Returns True if EMA weights were applied, False if not found (falls back to raw weights).
+    """
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ema_state = state.get("criterion", {}).get("ema_state", None)
+    if ema_state is None:
+        logger.warning("--use-ema requested but no 'ema_state' found in checkpoint criterion — "
+                       "using raw model weights.")
+        return False
+
+    missing, unexpected = [], []
+    model_params = dict(model.named_parameters())
+    for name, ema_tensor in ema_state.items():
+        if name in model_params:
+            model_params[name].data.copy_(ema_tensor.to(model_params[name].device))
+        else:
+            unexpected.append(name)
+    for name in model_params:
+        if name not in ema_state:
+            missing.append(name)
+
+    logger.info(f"EMA weights applied ({len(ema_state)} tensors). "
+                f"Missing from EMA: {len(missing)}, unexpected: {len(unexpected)}")
+    if missing:
+        logger.debug(f"  Missing (will keep raw): {missing[:5]}{'...' if len(missing)>5 else ''}")
+    return True
 
 
 def load_model(checkpoint_path, manifest_dir, device):
@@ -278,6 +315,10 @@ def run_inference(args):
     manifest_dir = os.path.dirname(args.manifest)
 
     model = load_model(args.checkpoint, manifest_dir, device)
+    if args.use_ema:
+        ema_applied = apply_ema_weights(model, args.checkpoint)
+        if ema_applied:
+            logger.info("Running inference with EMA weights.")
     whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
 
     # Image transform — values from mms-speech-nollm-e2e-synthvc.yaml

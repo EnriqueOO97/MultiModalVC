@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass, field
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from fairseq import metrics
 from fairseq.criterions import register_criterion
@@ -26,6 +27,10 @@ from .criterionSpeechE2E import E2EGanLoss, E2EGanLossConfig, LogMelSpectrogram,
 
 logger = logging.getLogger("src.criterionSpeechE2E_SynthVC")
 
+# Exclude frozen encoders (never change → EMA = weights, wasteful) and
+# discriminators (training-only, not used for inference).
+_EMA_EXCLUDE_PREFIXES = ("avhubert.", "whisper.", "mpd.", "msd.")
+_EMA_DECAY = 0.999  # Standard for HiFi-GAN / voice conversion models
 
 @dataclass
 class E2EGanLossSynthVCConfig(E2EGanLossConfig):
@@ -60,8 +65,19 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self.adv_warmup_updates = adv_warmup_updates
         self.use_multires_mel = use_multires_mel
         self._num_updates = 0
-        self._disc_active_since = None  # track when disc phase started
+        # _disc_active_since is stored in *model* update units (fairseq optimizer steps),
+        # which are preserved across resumes.  Previous code used criterion-call units
+        # (which reset to 0 on each resume), causing negative adv_weight after resume.
+        self._disc_active_since = None
+        self._adv_warmup_complete = False   # once True, adv_weight stays 1.0 forever
         self.multires_mel = None  # lazy init
+        self._pending_disc_optimizer_state = None  # deferred disc optimizer state from checkpoint
+        # Dummy parameter so fairseq's has_parameters() returns True and saves/loads
+        # criterion state (disc_optimizer, _disc_active_since, ema_state)
+        self._dummy_param = nn.Parameter(torch.zeros(1), requires_grad=False)
+        # EMA shadow copy of trained generator parameters (on-GPU, same dtype as model)
+        self._ema_state = {}
+        self._ema_initialized = False
         logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}, "
                      f"disc_start_updates={self.disc_start_updates}, "
                      f"disc_grad_clip={self.disc_grad_clip}, adv_warmup_updates={self.adv_warmup_updates}, "
@@ -93,6 +109,13 @@ class E2EGanLossSynthVC(E2EGanLoss):
             self.multires_mel = MultiResolutionMelLoss(num_mels=self.mel_num_mels).to(device)
             logger.info(f"[SynthVC Criterion] Initialized multi-resolution mel loss (3 scales, {self.mel_num_mels} bands)")
 
+        # Move EMA state to GPU after checkpoint load (checkpoints store EMA on CPU)
+        if self._ema_initialized and self._ema_state:
+            first_val = next(iter(self._ema_state.values()))
+            if first_val.device != device:
+                self._ema_state = {k: v.to(device) for k, v in self._ema_state.items()}
+                logger.info(f"[SynthVC EMA] Moved EMA state to {device}")
+
         if self.disc_optimizer is None:
             # Collect discriminator params - enable grad for optimizer
             disc_params = []
@@ -110,6 +133,39 @@ class E2EGanLossSynthVC(E2EGanLoss):
             )
             logger.info(f"[SynthVC Criterion] Initialized disc optimizer with lr={self.disc_lr}, "
                        f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}")
+
+            # Apply deferred disc_optimizer state from checkpoint resume
+            if self._pending_disc_optimizer_state is not None:
+                try:
+                    self.disc_optimizer.load_state_dict(self._pending_disc_optimizer_state)
+                    logger.info("[SynthVC Criterion] Loaded deferred disc_optimizer state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"[SynthVC Criterion] Failed to load disc_optimizer state: {e}")
+                self._pending_disc_optimizer_state = None
+
+    def _init_ema(self, model):
+        """Initialize EMA shadow copy on GPU (same dtype as model params — no PCIe transfer)."""
+        self._ema_state = {
+            name: param.data.clone()
+            for name, param in model.named_parameters()
+            if not any(name.startswith(p) for p in _EMA_EXCLUDE_PREFIXES)
+        }
+        self._ema_initialized = True
+        n = len(self._ema_state)
+        mb = sum(v.numel() * v.element_size() for v in self._ema_state.values()) / 1e6
+        logger.info(f"[SynthVC EMA] Initialized {n} tensors on GPU ({mb:.0f} MB, decay={_EMA_DECAY})")
+
+    def _update_ema(self, model):
+        """Update EMA shadow copy — all on GPU, no CUDA sync barriers."""
+        if not self._ema_initialized:
+            self._init_ema(model)
+            return  # first call: capture current weights, don't blend yet
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self._ema_state:
+                    self._ema_state[name].mul_(_EMA_DECAY).add_(
+                        param.data, alpha=1.0 - _EMA_DECAY
+                    )
 
     def forward(self, model, sample, reduce=True):
         """
@@ -226,6 +282,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
             # Increment update counter
             self._num_updates += 1
 
+            # EMA update: on-GPU, same dtype as model — no PCIe transfer, no CUDA sync
+            self._update_ema(model)
+
             if disc_active:
                 # =============================================================
                 # PHASE 2: Standard HiFi-GAN adversarial training
@@ -236,10 +295,12 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan"))
                 from hifigan.discriminator import feature_loss, discriminator_loss, generator_loss
 
-                # Track when disc phase started (for warmup)
+                # Track when disc phase started — use model.num_updates (fairseq optimizer
+                # steps, preserved across resumes) so _disc_active_since stays valid.
+                model_updates = getattr(model, 'num_updates', 0)
                 if self._disc_active_since is None:
-                    self._disc_active_since = self._num_updates
-                    logger.info(f"[SynthVC Criterion] Disc phase started at update {self._num_updates}")
+                    self._disc_active_since = model_updates
+                    logger.info(f"[SynthVC Criterion] Disc phase started at model_updates={model_updates}")
 
                 # Discriminator step
                 self.disc_optimizer.zero_grad()
@@ -271,11 +332,18 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 loss_gen_msd, _ = generator_loss(msd_fake_scores)
                 loss_gen_adv = loss_gen_mpd + loss_gen_msd
 
-                # Adversarial warmup: linearly ramp adv weight from 0→1
+                # Adversarial warmup: linearly ramp adv weight from 0→1.
+                # Uses model.num_updates (not local _num_updates) so warmup position
+                # is correctly restored across resumes.
+                # _adv_warmup_complete flag persists across resumes so warmup doesn't
+                # restart every 72h session once it has completed.
                 adv_weight = 1.0
-                if self.adv_warmup_updates > 0:
-                    steps_since_disc = self._num_updates - self._disc_active_since
-                    adv_weight = min(1.0, steps_since_disc / self.adv_warmup_updates)
+                if self.adv_warmup_updates > 0 and not self._adv_warmup_complete:
+                    steps_since_disc = model_updates - self._disc_active_since
+                    adv_weight = min(1.0, max(0.0, steps_since_disc / self.adv_warmup_updates))
+                    if adv_weight >= 1.0:
+                        self._adv_warmup_complete = True
+                        logger.info("[SynthVC Criterion] Adversarial warmup complete")
 
                 loss_gen = (self.mel_loss_weight * loss_mel
                             + adv_weight * (loss_fm + loss_gen_adv))
@@ -417,19 +485,54 @@ class E2EGanLossSynthVC(E2EGanLoss):
             return loss_gen, B, logging_output
 
     def state_dict(self):
-        """Save disc_active_since for warmup resume."""
+        """Save disc_active_since, adv_warmup_complete, and EMA state."""
         state = super().state_dict()
+        # disc_active_since is in model update units (preserved across resumes)
         if self._disc_active_since is not None:
-            state["disc_active_since"] = self._disc_active_since
+            state["disc_active_since_v2"] = self._disc_active_since
+        state["adv_warmup_complete"] = self._adv_warmup_complete
+        # EMA: move to CPU for checkpoint (device-agnostic storage)
+        if self._ema_initialized and self._ema_state:
+            state["ema_state"] = {k: v.cpu() for k, v in self._ema_state.items()}
         return state
 
     def load_state_dict(self, state_dict, strict=True):
-        """Restore disc_active_since for warmup resume."""
-        disc_active_since = state_dict.pop("disc_active_since", None)
-        super().load_state_dict(state_dict, strict)
-        if disc_active_since is not None:
-            self._disc_active_since = disc_active_since
-            logger.info(f"[SynthVC Criterion] Restored _disc_active_since={self._disc_active_since}")
+        """Restore criterion state from checkpoint.
+
+        The disc_optimizer doesn't exist yet at checkpoint load time (lazy init),
+        so we stash its state and apply it later in _lazy_init.
+        Handles None state_dict gracefully (old checkpoints before dummy param fix).
+        """
+        if state_dict is None:
+            logger.warning("[SynthVC Criterion] No criterion state in checkpoint "
+                         "(first resume after checkpoint fix — disc_optimizer state not available)")
+            return
+        # disc_active_since_v2: in model update units (current format)
+        disc_active_since_v2 = state_dict.pop("disc_active_since_v2", None)
+        # disc_active_since (old key): was in criterion-call units, which reset to 0 on
+        # each resume and caused negative adv_weight.  Discard it — warmup will restart.
+        state_dict.pop("disc_active_since", None)
+        adv_warmup_complete = state_dict.pop("adv_warmup_complete", False)
+        # Intercept disc_optimizer state for deferred loading in _lazy_init
+        pending_disc = state_dict.pop("disc_optimizer_state", None)
+        if pending_disc is not None:
+            self._pending_disc_optimizer_state = pending_disc
+            logger.info("[SynthVC Criterion] Stashed disc_optimizer state for deferred loading")
+        ema_state = state_dict.pop("ema_state", None)
+        # Use strict=False to tolerate keys from older checkpoints (e.g. logmel/multires_mel
+        # buffers that were saved by a previous code version but are no longer registered).
+        super().load_state_dict(state_dict, strict=False)
+        if disc_active_since_v2 is not None:
+            self._disc_active_since = disc_active_since_v2
+            logger.info(f"[SynthVC Criterion] Restored _disc_active_since={self._disc_active_since} (model updates)")
+        self._adv_warmup_complete = adv_warmup_complete
+        if adv_warmup_complete:
+            logger.info("[SynthVC Criterion] Adversarial warmup already complete (loaded from checkpoint)")
+        if ema_state is not None:
+            # EMA stored on CPU in checkpoint; _lazy_init will move to GPU
+            self._ema_state = ema_state
+            self._ema_initialized = True
+            logger.info(f"[SynthVC Criterion] Restored EMA state ({len(ema_state)} tensors, on CPU until _lazy_init)")
 
     @staticmethod
     def reduce_metrics(logging_outputs) -> None:
