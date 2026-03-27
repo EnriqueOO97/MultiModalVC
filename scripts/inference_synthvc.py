@@ -112,27 +112,39 @@ def get_parser():
     return parser
 
 
-def apply_ema_weights(model, checkpoint_path):
+def apply_ema_weights(model, ema_state):
     """Overwrite model weights with EMA shadow weights from the criterion state.
 
-    Returns True if EMA weights were applied, False if not found (falls back to raw weights).
+    ema_state: the dict already extracted from state["criterion"]["ema_state"],
+               or None.  Caller is responsible for loading (avoids double I/O).
+    Returns True if EMA weights were applied, False if not found.
     """
-    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    ema_state = state.get("criterion", {}).get("ema_state", None)
     if ema_state is None:
         logger.warning("--use-ema requested but no 'ema_state' found in checkpoint criterion — "
                        "using raw model weights.")
         return False
 
+    # During DDP training the model is wrapped multiple times (e.g. fairseq adds
+    # LegacyDistributedDataParallel on top of DistributedFairseqModel), so
+    # model.named_parameters() inside the criterion returns names like
+    # "module.module.conformer.blocks.0.weight".  At inference the model is
+    # unwrapped, so names are just "conformer.blocks.0.weight".
+    # Strip ALL leading "module." segments before matching.
+    def _strip_module(k):
+        while k.startswith("module."):
+            k = k[len("module."):]
+        return k
+
     missing, unexpected = [], []
     model_params = dict(model.named_parameters())
-    for name, ema_tensor in ema_state.items():
+    ema_state_stripped = {_strip_module(k): v for k, v in ema_state.items()}
+    for name, ema_tensor in ema_state_stripped.items():
         if name in model_params:
             model_params[name].data.copy_(ema_tensor.to(model_params[name].device))
         else:
             unexpected.append(name)
     for name in model_params:
-        if name not in ema_state:
+        if name not in ema_state_stripped:
             missing.append(name)
 
     logger.info(f"EMA weights applied ({len(ema_state)} tensors). "
@@ -142,8 +154,12 @@ def apply_ema_weights(model, checkpoint_path):
     return True
 
 
-def load_model(checkpoint_path, manifest_dir, device):
-    """Load the SynthVC model from checkpoint."""
+def load_model(checkpoint_path, manifest_dir, device, extract_ema=False):
+    """Load the SynthVC model from checkpoint.
+
+    Always returns (model, ema_state).  ema_state is None unless extract_ema=True
+    and EMA state is present in the checkpoint.
+    """
     logger.info(f"Loading model from {checkpoint_path}...")
 
     w2v_path = os.path.join(repo_root, "pretrained_models/avhubert/large_vox_iter5.pt")
@@ -155,13 +171,18 @@ def load_model(checkpoint_path, manifest_dir, device):
         },
         "model": {
             "w2v_path": w2v_path,
-            # Empty string is falsy → model's `if cfg.stage1_checkpoint` skips loading.
-            # Do NOT use "???" — that is Hydra's "mandatory missing" sentinel and
-            # OmegaConf will raise "Missing mandatory value" if you assign it.
             "stage1_checkpoint": "",
             "vocoder_checkpoint": "",
         },
     }
+
+    # EMA extraction: only pay for torch.load when --use-ema is requested.
+    ema_state = None
+    if extract_ema:
+        _raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        ema_state = _raw.get("criterion", {}).get("ema_state", None)
+        del _raw
+        logger.info(f"EMA state {'found' if ema_state else 'NOT FOUND'} in checkpoint.")
 
     try:
         models, cfg, task = checkpoint_utils.load_model_ensemble_and_task(
@@ -174,12 +195,10 @@ def load_model(checkpoint_path, manifest_dir, device):
         logger.warning(f"Ensemble loading failed: {e}")
         logger.info("Attempting fallback manual loading...")
 
-        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        cfg = OmegaConf.create(state["cfg"])
-
+        _fb = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        cfg = OmegaConf.create(_fb["cfg"])
         cfg.task.data = manifest_dir
         cfg.task.label_dir = manifest_dir
-        # cfg.model.data is read by build_model as w2v_args.task.data — must not be None
         cfg.model.data = manifest_dir
         cfg.model.w2v_path = w2v_path
         cfg.model.stage1_checkpoint = ""
@@ -190,12 +209,14 @@ def load_model(checkpoint_path, manifest_dir, device):
 
         from src.modelSpeechNoLLM_E2E_SynthVC import MMS_Speech_NoLLM_E2E_SynthVC
         model = MMS_Speech_NoLLM_E2E_SynthVC.build_model(cfg.model, task)
-        model.load_state_dict(state["model"], strict=False)
+
+        model.load_state_dict(_fb["model"], strict=False)
+        del _fb
 
     model.eval()
     model.to(device)
     logger.info("Model loaded and set to eval mode.")
-    return model
+    return model, ema_state
 
 
 # ---------------------------------------------------------------------------
@@ -314,9 +335,9 @@ def run_inference(args):
     os.makedirs(args.output_dir, exist_ok=True)
     manifest_dir = os.path.dirname(args.manifest)
 
-    model = load_model(args.checkpoint, manifest_dir, device)
+    model, ema_state = load_model(args.checkpoint, manifest_dir, device, extract_ema=args.use_ema)
     if args.use_ema:
-        ema_applied = apply_ema_weights(model, args.checkpoint)
+        ema_applied = apply_ema_weights(model, ema_state)
         if ema_applied:
             logger.info("Running inference with EMA weights.")
     whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
