@@ -22,10 +22,8 @@ from .modelSpeechNoLLM import MMS_Speech_NoLLM, MMS_Speech_NoLLM_Config
 # HiFi-GAN imports
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan"))
 from hifigan.generator import HifiganGenerator
-from hifigan.discriminator import (
-    MultiPeriodDiscriminator,
-    MultiScaleDiscriminator,
-)
+from hifigan.discriminator import MultiPeriodDiscriminator
+from hifigan.msstftd import MultiScaleSTFTDiscriminator
 
 logger = logging.getLogger(__name__)
 
@@ -105,17 +103,24 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         # HiFi-GAN Discriminator
         # =====================================================================
         self.mpd = MultiPeriodDiscriminator()
-        self.msd = MultiScaleDiscriminator()
+        # MS-STFT discriminator replaces MSD — tuned for 16kHz speech
+        self.msstftd = MultiScaleSTFTDiscriminator(
+            filters=32,
+            n_ffts=[1024, 512, 256],
+            hop_lengths=[256, 128, 64],
+            win_lengths=[1024, 512, 256],
+        )
 
-        # Load pretrained disc weights (stashed during _load_vocoder_weights)
+        # Load pretrained disc weights (stashed during _load_vocoder_weights).
+        # msd.* keys from old checkpoints will simply be skipped (strict=False).
         if self._pending_disc_state is not None:
             self._load_disc_weights(self._pending_disc_state)
             self._pending_disc_state = None
-        
-        # Freeze discriminator from fairseq's optimizer — it has its own
+
+        # Freeze discriminators from fairseq's optimizer — they have their own
         for param in self.mpd.parameters():
             param.requires_grad = False
-        for param in self.msd.parameters():
+        for param in self.msstftd.parameters():
             param.requires_grad = False
         
         # =====================================================================
@@ -151,7 +156,7 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         missing, unexpected = nn.Module.load_state_dict(self, stage1_state, strict=False)
         
         # Filter out expected missing/unexpected keys for cleaner logging
-        expected_missing_prefixes = ("vocoder_", "mpd.", "msd.")
+        expected_missing_prefixes = ("vocoder_", "mpd.", "msstftd.")
         truly_missing = [k for k in missing if not any(k.startswith(p) for p in expected_missing_prefixes)]
         if truly_missing:
             logger.warning(f"[E2E Model] Missing Stage 1 keys: {truly_missing}")
@@ -185,7 +190,7 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
             logger.warning(f"[E2E Model] Unexpected vocoder keys: {unexpected}")
         logger.info("[E2E Model] Vocoder weights loaded successfully")
 
-        # Stash discriminator state for loading after self.mpd/self.msd are created
+        # Stash discriminator state for loading after self.mpd/self.msstftd are created
         if "discriminator" in state and "model" in state["discriminator"]:
             self._pending_disc_state = state["discriminator"]["model"]
         elif "discriminator" in state and isinstance(state["discriminator"], dict):
@@ -193,30 +198,26 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
                 self._pending_disc_state = state["discriminator"]
 
     def _load_disc_weights(self, disc_state):
-        """Load pretrained discriminator weights into self.mpd and self.msd."""
+        """Load pretrained discriminator weights into self.mpd.
+        msd.* keys from old checkpoints are ignored — MS-STFT starts from scratch.
+        """
         mpd_state = {k[len("mpd."):]: v for k, v in disc_state.items() if k.startswith("mpd.")}
-        msd_state = {k[len("msd."):]: v for k, v in disc_state.items() if k.startswith("msd.")}
-
         if mpd_state:
             missing_mpd, unexpected_mpd = self.mpd.load_state_dict(mpd_state, strict=False)
             if missing_mpd:
                 logger.warning(f"[E2E Model] Missing MPD keys: {missing_mpd}")
             if unexpected_mpd:
                 logger.warning(f"[E2E Model] Unexpected MPD keys: {unexpected_mpd}")
-        if msd_state:
-            missing_msd, unexpected_msd = self.msd.load_state_dict(msd_state, strict=False)
-            if missing_msd:
-                logger.warning(f"[E2E Model] Missing MSD keys: {missing_msd}")
-            if unexpected_msd:
-                logger.warning(f"[E2E Model] Unexpected MSD keys: {unexpected_msd}")
-        logger.info(f"[E2E Model] Discriminator weights loaded (MPD: {len(mpd_state)} params, MSD: {len(msd_state)} params)")
+        skipped_msd = sum(1 for k in disc_state if k.startswith("msd."))
+        logger.info(f"[E2E Model] Discriminator weights loaded (MPD: {len(mpd_state)} keys). "
+                    f"Skipped {skipped_msd} legacy MSD keys — MS-STFT initialised from scratch.")
 
     def _freeze_for_phase2(self):
         """Freeze everything except vocoder and discriminators for Phase 2 adversarial training.
         Called once by the criterion when disc_active first becomes True."""
         if getattr(self, "_phase2_frozen", False):
             return
-        vocoder_disc_prefixes = ("vocoder_", "mpd.", "msd.")
+        vocoder_disc_prefixes = ("vocoder_", "mpd.", "msstftd.")
         for name, param in self.named_parameters():
             if not any(name.startswith(p) for p in vocoder_disc_prefixes):
                 param.requires_grad = False
@@ -504,6 +505,6 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
             waveform = waveform.unsqueeze(1)
         
         mpd_scores, mpd_features = self.mpd(waveform)
-        msd_scores, msd_features = self.msd(waveform)
-        
-        return mpd_scores, mpd_features, msd_scores, msd_features
+        msstftd_scores, msstftd_features = self.msstftd(waveform)
+
+        return mpd_scores, mpd_features, msstftd_scores, msstftd_features

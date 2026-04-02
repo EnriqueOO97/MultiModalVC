@@ -340,6 +340,18 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
             if synth_audio is None:
                 synth_audio = kwargs.get('synth_audio', None)
 
+            # Recompute target_lengths from synthetic audio lengths if available.
+            # During Phase 2 and inference the output duration should be driven by
+            # the synthetic input, not the canonical supervision audio.
+            synth_audio_lengths = kwargs['source'].get('synth_audio_lengths', None)
+            if synth_audio_lengths is None:
+                synth_audio_lengths = kwargs.get('synth_audio_lengths', None)
+            if synth_audio_lengths is not None:
+                synth_audio_lengths = synth_audio_lengths.to(dtype=torch.long)
+                target_lengths = torch.div(synth_audio_lengths + 2 * pad - n_fft, hop_length, rounding_mode='floor') + 1
+                target_lengths = torch.clamp(target_lengths, min=1)
+                max_target_len = int(target_lengths.max().item())
+
             if synth_audio is not None:
                 # Build source with synthetic audio for Whisper
                 synth_source = {

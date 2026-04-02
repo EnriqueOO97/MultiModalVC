@@ -14,6 +14,8 @@ disc_active is determined by: use_discriminator flag OR num_updates >= disc_star
 """
 
 import logging
+import os
+import sys
 from dataclasses import dataclass, field
 
 import torch
@@ -25,12 +27,32 @@ from fairseq.dataclass import FairseqDataclass
 
 from .criterionSpeechE2E import E2EGanLoss, E2EGanLossConfig, LogMelSpectrogram, MultiResolutionMelLoss
 
+# Add HiFi-GAN path once at module load time (avoid repeated sys.path.insert in forward())
+_HIFIGAN_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan")
+if _HIFIGAN_PATH not in sys.path:
+    sys.path.insert(0, _HIFIGAN_PATH)
+from hifigan.discriminator import feature_loss, discriminator_loss, generator_loss
+
 logger = logging.getLogger("src.criterionSpeechE2E_SynthVC")
 
 # Exclude frozen encoders (never change → EMA = weights, wasteful) and
 # discriminators (training-only, not used for inference).
-_EMA_EXCLUDE_PREFIXES = ("avhubert.", "whisper.", "mpd.", "msd.")
+# These are checked against STRIPPED (no module.) parameter names.
+_EMA_EXCLUDE_PREFIXES = ("avhubert.", "whisper.", "mpd.", "msstftd.")
 _EMA_DECAY = 0.999  # Standard for HiFi-GAN / voice conversion models
+
+
+def _ema_strip_module(name: str) -> str:
+    """Strip all leading 'module.' segments from a DDP-wrapped parameter name.
+
+    During DDP training (legacy_ddp + ModuleProxyWrapper), fairseq wraps the model
+    twice, so named_parameters() returns 'module.module.conformer.xxx'.
+    Storing EMA with stripped keys makes the EMA independent of DDP wrapping depth
+    and keeps keys consistent with the model state_dict (which fairseq already strips).
+    """
+    while name.startswith("module."):
+        name = name[len("module."):]
+    return name
 
 @dataclass
 class E2EGanLossSynthVCConfig(E2EGanLossConfig):
@@ -49,6 +71,15 @@ class E2EGanLossSynthVCConfig(E2EGanLossConfig):
     use_multires_mel: bool = field(
         default=False, metadata={"help": "Use multi-resolution mel loss (3 scales) instead of single-resolution"}
     )
+    disc_lr_t_max: int = field(
+        default=550000, metadata={"help": "T_max for disc cosine LR decay in num_updates units "
+                                        "(= max_update minus the num_updates at disc activation). "
+                                        "Default 550000 = 600000 max_update - 50000 disc activation point."}
+    )
+    disc_pretrain: bool = field(
+        default=True, metadata={"help": "Train discriminator during Phase 1 without adversarial gradient to generator. "
+                                        "Warms up disc weights so it is ready when adversarial training starts."}
+    )
 
 
 @register_criterion("e2e_gan_loss_synthvc", dataclass=E2EGanLossSynthVCConfig)
@@ -56,7 +87,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
     def __init__(self, task, mel_loss_weight=40.0, use_discriminator=True,
                  disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0,
                  disc_start_updates=30000, mel_num_mels=128, mel_hop_size=160,
-                 disc_grad_clip=0.0, adv_warmup_updates=0, use_multires_mel=False):
+                 disc_grad_clip=0.0, adv_warmup_updates=0, use_multires_mel=False,
+                 disc_lr_t_max=550000, disc_pretrain=True):
         super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas,
                          mel_num_mels=mel_num_mels, mel_hop_size=mel_hop_size)
         self.conv_loss_weight = conv_loss_weight
@@ -64,6 +96,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self.disc_grad_clip = disc_grad_clip
         self.adv_warmup_updates = adv_warmup_updates
         self.use_multires_mel = use_multires_mel
+        self.disc_lr_t_max = disc_lr_t_max
+        self.disc_pretrain = disc_pretrain
+        self.disc_lr_scheduler = None  # CosineAnnealingLR, created alongside disc_optimizer
         self._num_updates = 0
         # _disc_active_since is stored in *model* update units (fairseq optimizer steps),
         # which are preserved across resumes.  Previous code used criterion-call units
@@ -71,7 +106,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self._disc_active_since = None
         self._adv_warmup_complete = False   # once True, adv_weight stays 1.0 forever
         self.multires_mel = None  # lazy init
-        self._pending_disc_optimizer_state = None  # deferred disc optimizer state from checkpoint
+        self._pending_disc_optimizer_state = None   # deferred disc optimizer state from checkpoint
+        self._pending_disc_scheduler_state = None   # deferred disc LR scheduler state from checkpoint
         # Dummy parameter so fairseq's has_parameters() returns True and saves/loads
         # criterion state (disc_optimizer, _disc_active_since, ema_state)
         self._dummy_param = nn.Parameter(torch.zeros(1), requires_grad=False)
@@ -81,7 +117,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
         logger.info(f"[SynthVC Criterion] conv_loss_weight={self.conv_loss_weight}, "
                      f"disc_start_updates={self.disc_start_updates}, "
                      f"disc_grad_clip={self.disc_grad_clip}, adv_warmup_updates={self.adv_warmup_updates}, "
-                     f"use_multires_mel={self.use_multires_mel}, "
+                     f"use_multires_mel={self.use_multires_mel}, disc_lr_t_max={self.disc_lr_t_max}, "
+                     f"disc_pretrain={self.disc_pretrain}, "
                      f"mel_num_mels={mel_num_mels}, mel_hop_size={mel_hop_size}")
 
     def _is_disc_active(self, model=None):
@@ -122,7 +159,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
             for param in model.mpd.parameters():
                 param.requires_grad = True
                 disc_params.append(param)
-            for param in model.msd.parameters():
+            for param in model.msstftd.parameters():
                 param.requires_grad = True
                 disc_params.append(param)
 
@@ -131,10 +168,19 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 lr=self.disc_lr,
                 betas=self.disc_betas,
             )
+            # Cosine LR decay for the discriminator.
+            # T_max is in num_updates units; we step the scheduler once per num_updates tick
+            # (see the disc step in forward()). min_lr = disc_lr / 10.
+            self.disc_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.disc_optimizer,
+                T_max=self.disc_lr_t_max,
+                eta_min=self.disc_lr / 10.0,
+            )
             logger.info(f"[SynthVC Criterion] Initialized disc optimizer with lr={self.disc_lr}, "
-                       f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}")
+                       f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}, "
+                       f"cosine T_max={self.disc_lr_t_max}, eta_min={self.disc_lr/10.0}")
 
-            # Apply deferred disc_optimizer state from checkpoint resume
+            # Apply deferred disc_optimizer and scheduler states from checkpoint resume
             if self._pending_disc_optimizer_state is not None:
                 try:
                     self.disc_optimizer.load_state_dict(self._pending_disc_optimizer_state)
@@ -142,28 +188,48 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 except Exception as e:
                     logger.warning(f"[SynthVC Criterion] Failed to load disc_optimizer state: {e}")
                 self._pending_disc_optimizer_state = None
+            if self._pending_disc_scheduler_state is not None:
+                try:
+                    self.disc_lr_scheduler.load_state_dict(self._pending_disc_scheduler_state)
+                    logger.info("[SynthVC Criterion] Loaded deferred disc_lr_scheduler state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"[SynthVC Criterion] Failed to load disc_lr_scheduler state: {e}")
+                self._pending_disc_scheduler_state = None
 
     def _init_ema(self, model):
-        """Initialize EMA shadow copy on GPU (same dtype as model params — no PCIe transfer)."""
-        self._ema_state = {
-            name: param.data.clone()
-            for name, param in model.named_parameters()
-            if not any(name.startswith(p) for p in _EMA_EXCLUDE_PREFIXES)
-        }
+        """Initialize EMA shadow copy using canonical (stripped) parameter names.
+
+        Keys are stored WITHOUT any 'module.' prefix so the EMA is independent of
+        DDP wrapping depth.  The exclude filter is applied after stripping so it
+        correctly skips avhubert/whisper/mpd/msd regardless of how many 'module.'
+        layers the DDP wrapper adds.
+        """
+        self._ema_state = {}
+        for name, param in model.named_parameters():
+            clean = _ema_strip_module(name)
+            if any(clean.startswith(p) for p in _EMA_EXCLUDE_PREFIXES):
+                continue
+            self._ema_state[clean] = param.data.clone()
         self._ema_initialized = True
         n = len(self._ema_state)
         mb = sum(v.numel() * v.element_size() for v in self._ema_state.values()) / 1e6
-        logger.info(f"[SynthVC EMA] Initialized {n} tensors on GPU ({mb:.0f} MB, decay={_EMA_DECAY})")
+        logger.info(f"[SynthVC EMA] Initialized {n} tensors ({mb:.0f} MB, decay={_EMA_DECAY})")
 
     def _update_ema(self, model):
-        """Update EMA shadow copy — all on GPU, no CUDA sync barriers."""
+        """Update EMA shadow copy using canonical (stripped) parameter names.
+
+        Strips 'module.' prefixes before looking up in self._ema_state so the update
+        works correctly regardless of DDP wrapping depth.  Frozen params (requires_grad
+        =False) are still updated so the EMA converges to their frozen values over time.
+        """
         if not self._ema_initialized:
             self._init_ema(model)
             return  # first call: capture current weights, don't blend yet
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if name in self._ema_state:
-                    self._ema_state[name].mul_(_EMA_DECAY).add_(
+                clean = _ema_strip_module(name)
+                if clean in self._ema_state:
+                    self._ema_state[clean].mul_(_EMA_DECAY).add_(
                         param.data, alpha=1.0 - _EMA_DECAY
                     )
 
@@ -183,37 +249,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
         if disc_active:
             model._freeze_for_phase2()
 
-        # =====================================================================
-        # Phase 2 Validation Optimization
-        # Skip canonical 'valid' subset during Phase 2 to save resources
-        # =====================================================================
         subset_name = sample.get("subset_name", "train")
-        if not model.training and disc_active and subset_name == 'valid':
-            B = len(sample.get("id", [0]))
-            logging_output = {
-                "loss": 0.0,
-                "loss_mel": 0.0,
-                "loss_conv": 0.0,
-                "loss_mel_weighted": 0.0,
-                "loss_conv_weighted": 0.0,
-                "loss_fm": 0.0,
-                "loss_gen_adv": 0.0,
-                "loss_disc": 0.0,
-                "disc_active": 1,
-                "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
-                "sample_size": B,
-                "nsentences": B,
-                "val_mel_loss": 0.0,
-            }
-            if self.use_multires_mel:
-                for name in ["fine", "medium", "coarse"]:
-                    logging_output[f"mcd_{name}"] = 0.0
-                    logging_output[f"ssim_{name}"] = 0.0
-            else:
-                logging_output["mcd"] = 0.0
-                logging_output["ssim"] = 0.0
-            device = next(model.parameters()).device
-            return torch.tensor(0.0, device=device), B, logging_output
 
         # =====================================================================
         # Pass spk_embeddings, synth_audio, and disc_active into the model
@@ -225,9 +261,11 @@ class E2EGanLossSynthVC(E2EGanLoss):
         if "spk_embeddings" in sample:
             source["spk_embeddings"] = sample["spk_embeddings"].to(next(model.parameters()).device)
 
-        # Inject synthetic audio into source dict
+        # Inject synthetic audio and its lengths into source dict
         if "synth_audio" in sample:
             source["synth_audio"] = sample["synth_audio"].to(next(model.parameters()).device)
+        if "synth_audio_lengths" in sample:
+            source["synth_audio_lengths"] = sample["synth_audio_lengths"].to(next(model.parameters()).device)
 
         # Inject disc_active flag so the model knows which forward mode to use
         source["disc_active"] = disc_active
@@ -290,10 +328,6 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 # PHASE 2: Standard HiFi-GAN adversarial training
                 # No conversion loss. Waveform comes from synthetic pass.
                 # =============================================================
-                import sys
-                import os
-                sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan"))
-                from hifigan.discriminator import feature_loss, discriminator_loss, generator_loss
 
                 # Track when disc phase started — use model.num_updates (fairseq optimizer
                 # steps, preserved across resumes) so _disc_active_since stays valid.
@@ -305,32 +339,37 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 # Discriminator step
                 self.disc_optimizer.zero_grad()
                 mpd_real_scores, _ = model.mpd(gt_wav)
-                msd_real_scores, _ = model.msd(gt_wav)
+                msstftd_real_scores, _ = model.msstftd(gt_wav)
                 mpd_fake_scores, _ = model.mpd(pred_wav.detach())
-                msd_fake_scores, _ = model.msd(pred_wav.detach())
+                msstftd_fake_scores, _ = model.msstftd(pred_wav.detach())
 
                 loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
-                loss_disc_msd, _, _ = discriminator_loss(msd_real_scores, msd_fake_scores)
-                loss_disc = loss_disc_mpd + loss_disc_msd
+                loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
+                loss_disc = loss_disc_mpd + loss_disc_msstftd
                 loss_disc.backward()
 
                 # Gradient clipping for discriminator
                 if self.disc_grad_clip > 0:
-                    disc_params = list(model.mpd.parameters()) + list(model.msd.parameters())
+                    disc_params = list(model.mpd.parameters()) + list(model.msstftd.parameters())
                     torch.nn.utils.clip_grad_norm_(disc_params, self.disc_grad_clip)
 
                 self.disc_optimizer.step()
+                # Step cosine LR scheduler once per optimizer (num_updates) step, not per
+                # criterion call — this keeps the schedule aligned with num_updates units.
+                if self.disc_lr_scheduler is not None and model_updates > getattr(self, "_disc_sched_last_update", -1):
+                    self.disc_lr_scheduler.step()
+                    self._disc_sched_last_update = model_updates
 
                 # Generator step
                 mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
-                msd_real_scores, msd_real_feats = model.msd(gt_wav)
+                msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav)
                 mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
-                msd_fake_scores, msd_fake_feats = model.msd(pred_wav)
+                msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav)
 
-                loss_fm = feature_loss(mpd_real_feats, mpd_fake_feats) + feature_loss(msd_real_feats, msd_fake_feats)
+                loss_fm = feature_loss(mpd_real_feats, mpd_fake_feats) + feature_loss(msstftd_real_feats, msstftd_fake_feats)
                 loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
-                loss_gen_msd, _ = generator_loss(msd_fake_scores)
-                loss_gen_adv = loss_gen_mpd + loss_gen_msd
+                loss_gen_msstftd, _ = generator_loss(msstftd_fake_scores)
+                loss_gen_adv = loss_gen_mpd + loss_gen_msstftd
 
                 # Adversarial warmup: linearly ramp adv weight from 0→1.
                 # Uses model.num_updates (not local _num_updates) so warmup position
@@ -367,7 +406,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
             else:
                 # =============================================================
-                # PHASE 1: Mel + Conversion only (no discriminator)
+                # PHASE 1: Mel + Conversion only (no discriminator for generator)
                 # =============================================================
                 loss_conv = torch.tensor(0.0, device=pred_wav.device)
                 if canonical_features is not None and target_features is not None:
@@ -379,6 +418,32 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
                 loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv
 
+                # =============================================================
+                # PHASE 1 DISC PRE-TRAINING: Train discriminator as a classifier
+                # pred_wav is detached — no adversarial gradient reaches the generator.
+                # The disc optimizer is stepped but the LR scheduler is NOT —
+                # cosine decay budget is reserved for Phase 2 adversarial training.
+                # =============================================================
+                loss_disc_pretrain = 0.0
+                if self.disc_pretrain:
+                    self.disc_optimizer.zero_grad()
+                    mpd_real_scores, _ = model.mpd(gt_wav)
+                    msstftd_real_scores, _ = model.msstftd(gt_wav)
+                    mpd_fake_scores, _ = model.mpd(pred_wav.detach())
+                    msstftd_fake_scores, _ = model.msstftd(pred_wav.detach())
+
+                    loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
+                    loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
+                    loss_disc_pretrain_t = loss_disc_mpd + loss_disc_msstftd
+                    loss_disc_pretrain_t.backward()
+
+                    if self.disc_grad_clip > 0:
+                        disc_params = list(model.mpd.parameters()) + list(model.msstftd.parameters())
+                        torch.nn.utils.clip_grad_norm_(disc_params, self.disc_grad_clip)
+
+                    self.disc_optimizer.step()
+                    loss_disc_pretrain = loss_disc_pretrain_t.item()
+
                 logging_output = {
                     "loss": loss_gen.item(),
                     "loss_mel": loss_mel.item(),
@@ -387,7 +452,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss_conv_weighted": (self.conv_loss_weight * loss_conv).item(),
                     "loss_fm": 0.0,
                     "loss_gen_adv": 0.0,
-                    "loss_disc": 0.0,
+                    "loss_disc": loss_disc_pretrain,
                     "disc_active": 0,
                     "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                     "sample_size": B,
@@ -411,24 +476,20 @@ class E2EGanLossSynthVC(E2EGanLoss):
             loss_disc = torch.tensor(0.0, device=pred_wav.device)
 
             if disc_active and subset_name == 'valid_synth':
-                import sys
-                import os
-                sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_hifigan"))
-                from hifigan.discriminator import feature_loss, discriminator_loss, generator_loss
                 with torch.no_grad():
                     mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
-                    msd_real_scores, msd_real_feats = model.msd(gt_wav)
+                    msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav)
                     mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
-                    msd_fake_scores, msd_fake_feats = model.msd(pred_wav)
+                    msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav)
 
-                    loss_fm = feature_loss(mpd_real_feats, mpd_fake_feats) + feature_loss(msd_real_feats, msd_fake_feats)
+                    loss_fm = feature_loss(mpd_real_feats, mpd_fake_feats) + feature_loss(msstftd_real_feats, msstftd_fake_feats)
                     loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
-                    loss_gen_msd, _ = generator_loss(msd_fake_scores)
-                    loss_gen_adv = loss_gen_mpd + loss_gen_msd
+                    loss_gen_msstftd, _ = generator_loss(msstftd_fake_scores)
+                    loss_gen_adv = loss_gen_mpd + loss_gen_msstftd
 
                     loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
-                    loss_disc_msd, _, _ = discriminator_loss(msd_real_scores, msd_fake_scores)
-                    loss_disc = loss_disc_mpd + loss_disc_msd
+                    loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
+                    loss_disc = loss_disc_mpd + loss_disc_msstftd
 
             loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv
 
@@ -485,7 +546,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
             return loss_gen, B, logging_output
 
     def state_dict(self):
-        """Save disc_active_since, adv_warmup_complete, and EMA state."""
+        """Save disc_active_since, adv_warmup_complete, EMA state, and disc LR scheduler."""
         state = super().state_dict()
         # disc_active_since is in model update units (preserved across resumes)
         if self._disc_active_since is not None:
@@ -494,6 +555,10 @@ class E2EGanLossSynthVC(E2EGanLoss):
         # EMA: move to CPU for checkpoint (device-agnostic storage)
         if self._ema_initialized and self._ema_state:
             state["ema_state"] = {k: v.cpu() for k, v in self._ema_state.items()}
+        # Disc LR scheduler
+        if self.disc_lr_scheduler is not None:
+            state["disc_lr_scheduler_state"] = self.disc_lr_scheduler.state_dict()
+        state["disc_sched_last_update"] = getattr(self, "_disc_sched_last_update", -1)
         return state
 
     def load_state_dict(self, state_dict, strict=True):
@@ -513,11 +578,16 @@ class E2EGanLossSynthVC(E2EGanLoss):
         # each resume and caused negative adv_weight.  Discard it — warmup will restart.
         state_dict.pop("disc_active_since", None)
         adv_warmup_complete = state_dict.pop("adv_warmup_complete", False)
-        # Intercept disc_optimizer state for deferred loading in _lazy_init
+        # Intercept disc_optimizer and scheduler states for deferred loading in _lazy_init
         pending_disc = state_dict.pop("disc_optimizer_state", None)
         if pending_disc is not None:
             self._pending_disc_optimizer_state = pending_disc
             logger.info("[SynthVC Criterion] Stashed disc_optimizer state for deferred loading")
+        pending_sched = state_dict.pop("disc_lr_scheduler_state", None)
+        if pending_sched is not None:
+            self._pending_disc_scheduler_state = pending_sched
+            logger.info("[SynthVC Criterion] Stashed disc_lr_scheduler state for deferred loading")
+        self._disc_sched_last_update = state_dict.pop("disc_sched_last_update", -1)
         ema_state = state_dict.pop("ema_state", None)
         # Use strict=False to tolerate keys from older checkpoints (e.g. logmel/multires_mel
         # buffers that were saved by a previous code version but are no longer registered).
@@ -529,10 +599,12 @@ class E2EGanLossSynthVC(E2EGanLoss):
         if adv_warmup_complete:
             logger.info("[SynthVC Criterion] Adversarial warmup already complete (loaded from checkpoint)")
         if ema_state is not None:
-            # EMA stored on CPU in checkpoint; _lazy_init will move to GPU
-            self._ema_state = ema_state
+            # Strip any leading 'module.' prefixes from old checkpoints (saved before the
+            # canonical-key fix). New checkpoints already store clean keys; stripping is a no-op.
+            cleaned_ema = {_ema_strip_module(k): v for k, v in ema_state.items()}
+            self._ema_state = cleaned_ema
             self._ema_initialized = True
-            logger.info(f"[SynthVC Criterion] Restored EMA state ({len(ema_state)} tensors, on CPU until _lazy_init)")
+            logger.info(f"[SynthVC Criterion] Restored EMA state ({len(cleaned_ema)} tensors, on CPU until _lazy_init)")
 
     @staticmethod
     def reduce_metrics(logging_outputs) -> None:

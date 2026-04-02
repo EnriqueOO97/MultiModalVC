@@ -273,22 +273,22 @@ def wav_to_multires_mels(wav_np, device):
     return mels
 
 
-def save_mel_pair_pngs(canon_mels, syn_mels, syn_idx, sample_id, output_dir):
-    """Save one paired PNG per resolution scale (canon on top, synth on bottom).
+def save_mel_pair_pngs(canon_mels, pred_mels, syn_idx, sample_id, output_dir):
+    """Save one paired PNG per resolution scale (canonical on top, model prediction on bottom).
 
     Output file names:  mel_fine_{ID}.png / mel_medium_{ID}.png / mel_coarse_{ID}.png
     """
     for name in ("fine", "medium", "coarse"):
         canon = canon_mels[name].numpy()   # (num_mels, T_canon)
-        synth  = syn_mels[name].numpy()    # (num_mels, T_synth)
+        pred  = pred_mels[name].numpy()    # (num_mels, T_pred)
 
         fig, axes = plt.subplots(2, 1, figsize=(12, 5))
 
         for ax, data, title in zip(
             axes,
-            [canon, synth],
+            [canon, pred],
             [f"Canonical  —  {sample_id}",
-             f"Synthetic {syn_idx}  —  {sample_id}"],
+             f"Prediction Syn{syn_idx}  —  {sample_id}"],
         ):
             im = ax.imshow(data, aspect="auto", origin="lower",
                            interpolation="nearest", cmap="magma")
@@ -386,6 +386,7 @@ def run_inference(args):
 
         # Pick one synthetic index (1-based) for mel generation — chosen once per entry
         mel_syn_idx = random.randint(1, 6)
+        pred_wav_for_mel = None  # will hold the model prediction for mel_syn_idx
 
         # Run all 6 synthetic variants
         for syn_idx, synth_path in enumerate(synth_paths, start=1):
@@ -422,33 +423,35 @@ def run_inference(args):
             total_saved += 1
             logger.debug(f"Saved {out_name} | samples={len(wav_int16)}")
 
+            # Capture the prediction for mel plotting
+            if syn_idx == mel_syn_idx:
+                pred_wav_for_mel = wav_np
+
         # -------------------------------------------------------------------
         # Multi-resolution mel generation (once per entry)
-        # Synthetic: the randomly chosen variant (mel_syn_idx, 1-based)
-        # Canonical: the original canonical audio waveform
+        # Prediction: model output for the randomly chosen variant (mel_syn_idx)
+        # Canonical:  the original canonical audio waveform
         # -------------------------------------------------------------------
-        try:
-            # --- Synthetic mels ---
-            chosen_synth_path = synth_paths[mel_syn_idx - 1]
-            _, syn_wav = wavfile.read(chosen_synth_path)
-            if syn_wav.dtype == np.int16:
-                syn_wav = syn_wav / 32768.0
-            syn_wav = syn_wav.astype(np.float32)
-            syn_mels = wav_to_multires_mels(syn_wav, device)
+        if pred_wav_for_mel is not None:
+            try:
+                # --- Prediction mels ---
+                pred_mels = wav_to_multires_mels(pred_wav_for_mel, device)
 
-            # --- Canonical mels ---
-            _, canon_wav = wavfile.read(canon_path)
-            if canon_wav.dtype == np.int16:
-                canon_wav = canon_wav / 32768.0
-            canon_wav = canon_wav.astype(np.float32)
-            canon_mels = wav_to_multires_mels(canon_wav, device)
+                # --- Canonical mels ---
+                _, canon_wav = wavfile.read(canon_path)
+                if canon_wav.dtype == np.int16:
+                    canon_wav = canon_wav / 32768.0
+                canon_wav = canon_wav.astype(np.float32)
+                canon_mels = wav_to_multires_mels(canon_wav, device)
 
-            # --- Save paired PNGs (canon top / synth bottom, one per scale) ---
-            save_mel_pair_pngs(canon_mels, syn_mels, mel_syn_idx, sample_id,
-                               args.output_dir)
-            logger.info(f"{sample_id}: saved mel pair PNGs (Syn{mel_syn_idx} vs canonical)")
-        except Exception as e:
-            logger.warning(f"{sample_id}: mel generation failed — {e}")
+                # --- Save paired PNGs (canon top / prediction bottom, one per scale) ---
+                save_mel_pair_pngs(canon_mels, pred_mels, mel_syn_idx, sample_id,
+                                   args.output_dir)
+                logger.info(f"{sample_id}: saved mel pair PNGs (Syn{mel_syn_idx} prediction vs canonical)")
+            except Exception as e:
+                logger.warning(f"{sample_id}: mel generation failed — {e}")
+        else:
+            logger.warning(f"{sample_id}: no prediction available for mel_syn_idx={mel_syn_idx}, skipping mel PNGs")
 
     logger.info(f"Done. Saved {total_saved} WAV files to {args.output_dir}")
 

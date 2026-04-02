@@ -172,7 +172,7 @@ class E2EGanLoss(FairseqCriterion):
             for param in model.mpd.parameters():
                 param.requires_grad = True
                 disc_params.append(param)
-            for param in model.msd.parameters():
+            for param in model.msstftd.parameters():
                 param.requires_grad = True
                 disc_params.append(param)
             
@@ -237,32 +237,32 @@ class E2EGanLoss(FairseqCriterion):
                 self.disc_optimizer.zero_grad()
                 
                 mpd_real_scores, _ = model.mpd(gt_wav)
-                msd_real_scores, _ = model.msd(gt_wav)
-                
+                msstftd_real_scores, _ = model.msstftd(gt_wav)
+
                 mpd_fake_scores, _ = model.mpd(pred_wav.detach())
-                msd_fake_scores, _ = model.msd(pred_wav.detach())
-                
+                msstftd_fake_scores, _ = model.msstftd(pred_wav.detach())
+
                 loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
-                loss_disc_msd, _, _ = discriminator_loss(msd_real_scores, msd_fake_scores)
-                loss_disc = loss_disc_mpd + loss_disc_msd
-                
+                loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
+                loss_disc = loss_disc_mpd + loss_disc_msstftd
+
                 loss_disc.backward()
                 self.disc_optimizer.step()
-                
+
                 # --- Generator step ---
                 mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
-                msd_real_scores, msd_real_feats = model.msd(gt_wav)
-                
+                msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav)
+
                 mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
-                msd_fake_scores, msd_fake_feats = model.msd(pred_wav)
-                
+                msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav)
+
                 loss_fm_mpd = feature_loss(mpd_real_feats, mpd_fake_feats)
-                loss_fm_msd = feature_loss(msd_real_feats, msd_fake_feats)
-                loss_fm = loss_fm_mpd + loss_fm_msd
-                
+                loss_fm_msstftd = feature_loss(msstftd_real_feats, msstftd_fake_feats)
+                loss_fm = loss_fm_mpd + loss_fm_msstftd
+
                 loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
-                loss_gen_msd, _ = generator_loss(msd_fake_scores)
-                loss_gen_adv = loss_gen_mpd + loss_gen_msd
+                loss_gen_msstftd, _ = generator_loss(msstftd_fake_scores)
+                loss_gen_adv = loss_gen_mpd + loss_gen_msstftd
                 
                 loss_gen = self.mel_loss_weight * loss_mel + loss_fm + loss_gen_adv
                 
