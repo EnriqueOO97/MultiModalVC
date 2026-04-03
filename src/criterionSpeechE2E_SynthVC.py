@@ -154,6 +154,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 logger.info(f"[SynthVC EMA] Moved EMA state to {device}")
 
         if self.disc_optimizer is None:
+            # MS-STFT disc uses cuFFT internally which does not support BFloat16.
+            # Cast only msstftd to float32; MPD works fine in bf16.
+            model.msstftd.float()
             # Collect discriminator params - enable grad for optimizer
             disc_params = []
             for param in model.mpd.parameters():
@@ -336,12 +339,17 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     self._disc_active_since = model_updates
                     logger.info(f"[SynthVC Criterion] Disc phase started at model_updates={model_updates}")
 
+                # cuFFT (used by MS-STFT disc) does not support BFloat16.
+                # Only msstftd needs float32 input; MPD stays in bf16.
+                gt_wav_f32 = gt_wav.float()
+                pred_wav_f32 = pred_wav.float()
+
                 # Discriminator step
                 self.disc_optimizer.zero_grad()
                 mpd_real_scores, _ = model.mpd(gt_wav)
-                msstftd_real_scores, _ = model.msstftd(gt_wav)
+                msstftd_real_scores, _ = model.msstftd(gt_wav_f32)
                 mpd_fake_scores, _ = model.mpd(pred_wav.detach())
-                msstftd_fake_scores, _ = model.msstftd(pred_wav.detach())
+                msstftd_fake_scores, _ = model.msstftd(pred_wav_f32.detach())
 
                 loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
                 loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
@@ -362,9 +370,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
                 # Generator step
                 mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
-                msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav)
+                msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav_f32)
                 mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
-                msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav)
+                msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav_f32)
 
                 loss_fm = feature_loss(mpd_real_feats, mpd_fake_feats) + feature_loss(msstftd_real_feats, msstftd_fake_feats)
                 loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
@@ -426,11 +434,15 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 # =============================================================
                 loss_disc_pretrain = 0.0
                 if self.disc_pretrain:
+                    # cuFFT (used by MS-STFT disc) does not support BFloat16.
+                    # Only msstftd needs float32 input; MPD stays in bf16.
+                    gt_wav_f32 = gt_wav.float()
+                    pred_wav_f32 = pred_wav.float()
                     self.disc_optimizer.zero_grad()
                     mpd_real_scores, _ = model.mpd(gt_wav)
-                    msstftd_real_scores, _ = model.msstftd(gt_wav)
+                    msstftd_real_scores, _ = model.msstftd(gt_wav_f32)
                     mpd_fake_scores, _ = model.mpd(pred_wav.detach())
-                    msstftd_fake_scores, _ = model.msstftd(pred_wav.detach())
+                    msstftd_fake_scores, _ = model.msstftd(pred_wav_f32.detach())
 
                     loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
                     loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
@@ -477,10 +489,12 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
             if disc_active and subset_name == 'valid_synth':
                 with torch.no_grad():
+                    gt_wav_f32 = gt_wav.float()
+                    pred_wav_f32 = pred_wav.float()
                     mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
-                    msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav)
+                    msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav_f32)
                     mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
-                    msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav)
+                    msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav_f32)
 
                     loss_fm = feature_loss(mpd_real_feats, mpd_fake_feats) + feature_loss(msstftd_real_feats, msstftd_fake_feats)
                     loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
