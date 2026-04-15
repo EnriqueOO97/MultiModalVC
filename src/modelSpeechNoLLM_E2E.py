@@ -320,6 +320,12 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         if state is not None:
             task_pretrain.load_state_dict(state['task_state'])
 
+        # Patch None-valued fields in w2v_args.model that are not set in the
+        # training yaml (e.g. dropout_input). Newer/stricter OmegaConf versions
+        # reject None being merged into a non-Optional typed dataclass field.
+        if getattr(w2v_args.model, 'dropout_input', None) is None:
+            w2v_args.model.dropout_input = 0.0
+
         encoder_ = task_pretrain.build_model(w2v_args.model)
         avhubert = HubertEncoderWrapper(encoder_)
         if state is not None and not cfg.no_pretrained_weights:
