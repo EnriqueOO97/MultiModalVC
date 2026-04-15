@@ -122,6 +122,7 @@ else
         criterion.disc_grad_clip=${DISC_GRAD_CLIP:-10.0} \
         criterion.adv_warmup_updates=${ADV_WARMUP_UPDATES:-5000} \
         criterion.use_multires_mel=${USE_MULTIRES_MEL:-true} \
+        +model.use_cqt=${USE_CQT:-false} \
         optimization.update_freq=[4] \
         optimization.clip_norm=${CLIP_NORM:-10.0} \
         optimization.lr=[2e-4] \

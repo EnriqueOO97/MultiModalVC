@@ -270,8 +270,18 @@ class MMS_LLaMA(BaseFairseqModel):
         state = {k:v for k,v in old_state.items() if k not in self.freeze_params}
         return state
     
-    def load_state_dict(self,state,**kwargs):
-        super().load_state_dict(state, strict=False)   
+    def load_state_dict(self, state, **kwargs):
+        current_state = super().state_dict()
+        filtered_state = {}
+        skipped = []
+        for k, v in state.items():
+            if k in current_state and v.shape != current_state[k].shape:
+                skipped.append(f"{k}: ckpt{list(v.shape)} -> model{list(current_state[k].shape)}")
+            else:
+                filtered_state[k] = v
+        if skipped:
+            print(f"[Model] Skipping {len(skipped)} shape-mismatched keys: {skipped}")
+        super().load_state_dict(filtered_state, strict=False)
 
     def forward(self, **kwargs):
         # ============================

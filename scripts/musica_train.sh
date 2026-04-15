@@ -32,6 +32,7 @@ export PYTHONPATH="$PROJECT_ROOT/fairseq:$PROJECT_ROOT:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=1  # Single-node job: force NVLink (NVSwitch) instead of InfiniBand
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # Auto-detect and append CUDA libraries (fixing version discovery)
 if [ -n "$CONDA_PREFIX" ]; then
@@ -89,7 +90,7 @@ else
         task.label_dir=$PROJECT_ROOT/manifest/germanManifest \
         task.noise_prob=0.50 \
         task.noise_wav=$PROJECT_ROOT/noise/babble_noise.wav \
-        dataset.batch_size=${BATCH_SIZE:-12} \
+        dataset.batch_size=${BATCH_SIZE:-9} \
         dataset.max_tokens=23000 \
         dataset.required_batch_size_multiple=1 \
         dataset.validate_interval=${VALIDATE_INTERVAL:-5} \
@@ -119,16 +120,19 @@ else
         criterion.disc_start_updates=${DISC_START_UPDATES:-200000} \
         criterion.mel_num_mels=${MEL_NUM_MELS:-80} \
         criterion.mel_hop_size=${MEL_HOP_SIZE:-320} \
-        criterion.disc_grad_clip=${DISC_GRAD_CLIP:-10.0} \
+        criterion.disc_grad_clip=${DISC_GRAD_CLIP:-20.0} \
         criterion.adv_warmup_updates=${ADV_WARMUP_UPDATES:-5000} \
+        +criterion.disc_pretrain=${DISC_PRETRAIN:-true} \
         criterion.use_multires_mel=${USE_MULTIRES_MEL:-true} \
-        optimization.update_freq=[2] \
-        optimization.clip_norm=${CLIP_NORM:-10.0} \
+        +model.use_cqt=${USE_CQT:-false} \
+        +model.upsampling_method=${UPSAMPLING_METHOD:-interpolation} \
+        optimization.update_freq=[3] \
+        optimization.clip_norm=${CLIP_NORM:-20.0} \
         optimization.lr=[2e-4] \
         optimizer._name=adam \
         +optimizer.weight_decay=0.01 \
         optimization.max_update=600000 \
-        optimization.max_epoch=200 \
+        optimization.max_epoch=400 \
         lr_scheduler._name=cosine \
         lr_scheduler.warmup_updates=2000 \
         distributed_training.distributed_world_size=${NGPUS} \

@@ -142,7 +142,13 @@ class MultiScaleSTFTDiscriminator(nn.Module):
         logits = []
         fmaps = []
         for disc in self.discriminators:
-            logit, fmap = disc(x)
+            # Pad audio if shorter than this scale's n_fft (center=False requires len > n_fft)
+            if x.shape[-1] < disc.n_fft:
+                pad_len = disc.n_fft - x.shape[-1]
+                x_in = torch.nn.functional.pad(x, (0, pad_len))
+            else:
+                x_in = x
+            logit, fmap = disc(x_in)
             logits.append(logit)
             fmaps.append(fmap)
         return logits, fmaps

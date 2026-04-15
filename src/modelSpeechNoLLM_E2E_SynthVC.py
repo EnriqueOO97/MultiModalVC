@@ -10,6 +10,7 @@ Inherits from MMS_Speech_NoLLM_E2E and adds:
 The conversion loss is L1 between canonical_features and target_features.
 """
 
+import math
 import sys
 import os
 import logging
@@ -25,6 +26,16 @@ from .modelSpeechNoLLM_E2E import MMS_Speech_NoLLM_E2E, MMS_Speech_NoLLM_E2E_Con
 from .divise_conformer.encoder_xattn import ConformerEncoderWithCrossAttn
 
 logger = logging.getLogger(__name__)
+
+
+def sinusoidal_embedding(length, dim, device, dtype=torch.float32):
+    """Generate sinusoidal positional embeddings of shape (1, length, dim)."""
+    position = torch.arange(length, device=device).unsqueeze(1).float()
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device).float() * -(math.log(10000.0) / dim))
+    emb = torch.zeros(1, length, dim, device=device)
+    emb[0, :, 0::2] = torch.sin(position * div_term)
+    emb[0, :, 1::2] = torch.cos(position * div_term)
+    return emb.to(dtype)
 
 
 @dataclass
@@ -53,6 +64,17 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         # The parent already created self.conformer = ConformerEncoder(size="L")
         # We replace it here with our cross-attention version
         self.conformer = ConformerEncoderWithCrossAttn(size="L")
+
+        # Upsampling modules (only created for non-default methods)
+        if cfg.upsampling_method == "transposed_conv":
+            self.upsample_conv1 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
+            self.upsample_conv2 = nn.ConvTranspose1d(768, 768, kernel_size=8, stride=4, padding=2)
+            self.upsample_act = nn.LeakyReLU(0.1)
+            logger.info("[SynthVC Model] Using transposed conv upsampling (2x → 4x = 8x)")
+        elif cfg.upsampling_method == "cross_attention":
+            self.upsample_cross_attn = nn.MultiheadAttention(embed_dim=768, num_heads=1, batch_first=True)
+            self.upsample_pos_proj = nn.Linear(768, 768)
+            logger.info("[SynthVC Model] Using cross-attention upsampling (1 head)")
 
         # Update freeze_params list after replacing conformer
         self.freeze_params = [n for n, p in self.named_parameters() if not p.requires_grad]
@@ -238,16 +260,40 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         x = self.proj1(av_hidden_padded.to(self.proj1.weight.dtype))
         x = self.ln1(x)
 
-        # 6. Interpolation to target audio length
+        # 6. Upsample to target audio length
         x = x.transpose(1, 2)  # (B, C, T)
         B, C, T_av = x.size()
         x_up = x.new_zeros((B, C, max_target_len))
-        for i in range(B):
-            actual_av_len = av_lengths[i]
-            x_slice = x[i:i + 1, :, :actual_av_len]
-            tgt_len = int(target_lengths[i].item())
-            x_i = F.interpolate(x_slice, size=tgt_len, mode='linear', align_corners=False)
-            x_up[i, :, :tgt_len] = x_i[0]
+
+        if self.cfg.upsampling_method == "transposed_conv":
+            for i in range(B):
+                x_slice = x[i:i + 1, :, :av_lengths[i]]
+                x_slice = self.upsample_act(self.upsample_conv1(x_slice))
+                x_slice = self.upsample_act(self.upsample_conv2(x_slice))
+                tgt_len = int(target_lengths[i].item())
+                logger.debug(f"[upsample] after_conv={x_slice.shape[-1]}, target={tgt_len}, "
+                             f"residual_ratio={tgt_len / x_slice.shape[-1]:.2f}")
+                x_i = F.interpolate(x_slice, size=tgt_len, mode='linear', align_corners=False)
+                x_up[i, :, :tgt_len] = x_i[0]
+
+        elif self.cfg.upsampling_method == "cross_attention":
+            x_t = x.transpose(1, 2)  # (B, T, C) for cross-attention
+            for i in range(B):
+                tgt_len = int(target_lengths[i].item())
+                pos_emb = sinusoidal_embedding(tgt_len, C, device=x.device, dtype=x.dtype)  # (1, tgt_len, C)
+                queries = self.upsample_pos_proj(pos_emb)
+                kv = x_t[i:i + 1, :av_lengths[i], :]  # (1, T_qf, C)
+                out, _ = self.upsample_cross_attn(queries, kv, kv)  # (1, tgt_len, C)
+                x_up[i, :, :tgt_len] = out[0].transpose(0, 1)  # (C, tgt_len)
+
+        else:  # "interpolation" — default, backward-compatible
+            for i in range(B):
+                actual_av_len = av_lengths[i]
+                x_slice = x[i:i + 1, :, :actual_av_len]
+                tgt_len = int(target_lengths[i].item())
+                x_i = F.interpolate(x_slice, size=tgt_len, mode='linear', align_corners=False)
+                x_up[i, :, :tgt_len] = x_i[0]
+
         x = x_up.transpose(1, 2)  # (B, T, C)
 
         # 7. Projection 2 + Conformer with cross-attention

@@ -167,12 +167,16 @@ class E2EGanLoss(FairseqCriterion):
             self.logmel = LogMelSpectrogram(num_mels=self.mel_num_mels, hop_size=self.mel_hop_size).to(device)
         
         if self.disc_optimizer is None and self.use_discriminator:
+            # Detect which spectral discriminator is available (CQT or MS-STFT)
+            self._use_cqt = hasattr(model, 'cqtd')
+            self._spec_disc = model.cqtd if self._use_cqt else model.msstftd
+            self._spec_disc.float()  # cuFFT does not support BFloat16
             # Collect discriminator params - enable grad for optimizer
             disc_params = []
             for param in model.mpd.parameters():
                 param.requires_grad = True
                 disc_params.append(param)
-            for param in model.msstftd.parameters():
+            for param in self._spec_disc.parameters():
                 param.requires_grad = True
                 disc_params.append(param)
             
@@ -237,10 +241,10 @@ class E2EGanLoss(FairseqCriterion):
                 self.disc_optimizer.zero_grad()
                 
                 mpd_real_scores, _ = model.mpd(gt_wav)
-                msstftd_real_scores, _ = model.msstftd(gt_wav)
+                msstftd_real_scores, _ = self._spec_disc(gt_wav)
 
                 mpd_fake_scores, _ = model.mpd(pred_wav.detach())
-                msstftd_fake_scores, _ = model.msstftd(pred_wav.detach())
+                msstftd_fake_scores, _ = self._spec_disc(pred_wav.detach())
 
                 loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
                 loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
@@ -251,10 +255,10 @@ class E2EGanLoss(FairseqCriterion):
 
                 # --- Generator step ---
                 mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
-                msstftd_real_scores, msstftd_real_feats = model.msstftd(gt_wav)
+                msstftd_real_scores, msstftd_real_feats = self._spec_disc(gt_wav)
 
                 mpd_fake_scores, mpd_fake_feats = model.mpd(pred_wav)
-                msstftd_fake_scores, msstftd_fake_feats = model.msstftd(pred_wav)
+                msstftd_fake_scores, msstftd_fake_feats = self._spec_disc(pred_wav)
 
                 loss_fm_mpd = feature_loss(mpd_real_feats, mpd_fake_feats)
                 loss_fm_msstftd = feature_loss(msstftd_real_feats, msstftd_fake_feats)

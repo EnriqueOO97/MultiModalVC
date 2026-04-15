@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from hifigan.generator import HifiganGenerator
 from hifigan.discriminator import MultiPeriodDiscriminator
 from hifigan.msstftd import MultiScaleSTFTDiscriminator
+from hifigan.cqtd import MultiScaleSubbandCQTDiscriminator
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,15 @@ class MMS_Speech_NoLLM_E2E_Config(MMS_Speech_NoLLM_Config):
     # Whether to freeze Stage 1 components initially
     freeze_stage1: bool = field(
         default=True, metadata={"help": "Whether to freeze Stage 1 components initially"}
+    )
+    # Use CQT discriminator instead of MS-STFT discriminator
+    use_cqt: bool = field(
+        default=False, metadata={"help": "Use multi-scale CQT discriminator instead of MS-STFT discriminator"}
+    )
+    # Upsampling method for Q-Former tokens → mel frame length
+    upsampling_method: str = field(
+        default="interpolation",
+        metadata={"help": "Upsampling method: 'interpolation' (default), 'transposed_conv', or 'cross_attention'"}
     )
 
 
@@ -103,13 +113,21 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         # HiFi-GAN Discriminator
         # =====================================================================
         self.mpd = MultiPeriodDiscriminator()
-        # MS-STFT discriminator replaces MSD — tuned for 16kHz speech
-        self.msstftd = MultiScaleSTFTDiscriminator(
-            filters=32,
-            n_ffts=[1024, 512, 256],
-            hop_lengths=[256, 128, 64],
-            win_lengths=[1024, 512, 256],
-        )
+        self.use_cqt = cfg.use_cqt
+
+        if cfg.use_cqt:
+            # Multi-scale CQT discriminator (5 scales, hop-aligned to generator hop=160)
+            self.cqtd = MultiScaleSubbandCQTDiscriminator()
+            logger.info("[E2E Model] Using CQT discriminator (5 scales)")
+        else:
+            # MS-STFT discriminator (5 scales) — default
+            self.msstftd = MultiScaleSTFTDiscriminator(
+                filters=32,
+                n_ffts=[1024, 512, 2048, 4096, 8192],
+                hop_lengths=[ 256, 128,  512, 1024, 2048],
+                win_lengths=[1024, 512, 2048, 4096, 8192],
+            )
+            logger.info("[E2E Model] Using MS-STFT discriminator (5 scales)")
 
         # Load pretrained disc weights (stashed during _load_vocoder_weights).
         # msd.* keys from old checkpoints will simply be skipped (strict=False).
@@ -120,8 +138,12 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         # Freeze discriminators from fairseq's optimizer — they have their own
         for param in self.mpd.parameters():
             param.requires_grad = False
-        for param in self.msstftd.parameters():
-            param.requires_grad = False
+        if hasattr(self, 'msstftd'):
+            for param in self.msstftd.parameters():
+                param.requires_grad = False
+        if hasattr(self, 'cqtd'):
+            for param in self.cqtd.parameters():
+                param.requires_grad = False
         
         # =====================================================================
         # Optionally freeze Stage 1 components
@@ -156,7 +178,7 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         missing, unexpected = nn.Module.load_state_dict(self, stage1_state, strict=False)
         
         # Filter out expected missing/unexpected keys for cleaner logging
-        expected_missing_prefixes = ("vocoder_", "mpd.", "msstftd.")
+        expected_missing_prefixes = ("vocoder_", "mpd.", "msstftd.", "cqtd.")
         truly_missing = [k for k in missing if not any(k.startswith(p) for p in expected_missing_prefixes)]
         if truly_missing:
             logger.warning(f"[E2E Model] Missing Stage 1 keys: {truly_missing}")
@@ -217,7 +239,7 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         Called once by the criterion when disc_active first becomes True."""
         if getattr(self, "_phase2_frozen", False):
             return
-        vocoder_disc_prefixes = ("vocoder_", "mpd.", "msstftd.")
+        vocoder_disc_prefixes = ("vocoder_", "mpd.", "msstftd.", "cqtd.")
         for name, param in self.named_parameters():
             if not any(name.startswith(p) for p in vocoder_disc_prefixes):
                 param.requires_grad = False
