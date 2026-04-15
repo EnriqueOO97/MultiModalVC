@@ -112,22 +112,27 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         # =====================================================================
         # HiFi-GAN Discriminator
         # =====================================================================
-        self.mpd = MultiPeriodDiscriminator()
         self.use_cqt = cfg.use_cqt
 
-        if cfg.use_cqt:
-            # Multi-scale CQT discriminator (5 scales, hop-aligned to generator hop=160)
-            self.cqtd = MultiScaleSubbandCQTDiscriminator()
-            logger.info("[E2E Model] Using CQT discriminator (5 scales)")
-        else:
-            # MS-STFT discriminator (5 scales) — default
-            self.msstftd = MultiScaleSTFTDiscriminator(
-                filters=32,
-                n_ffts=[1024, 512, 2048, 4096, 8192],
-                hop_lengths=[ 256, 128,  512, 1024, 2048],
-                win_lengths=[1024, 512, 2048, 4096, 8192],
-            )
-            logger.info("[E2E Model] Using MS-STFT discriminator (5 scales)")
+        # Discriminators are training-only. Wrap instantiation so that inference
+        # environments missing optional dependencies (e.g. nnAudio for CQT) can
+        # still load and run the generator without error.
+        try:
+            self.mpd = MultiPeriodDiscriminator()
+            if cfg.use_cqt:
+                self.cqtd = MultiScaleSubbandCQTDiscriminator()
+                logger.info("[E2E Model] Using CQT discriminator (5 scales)")
+            else:
+                self.msstftd = MultiScaleSTFTDiscriminator(
+                    filters=32,
+                    n_ffts=[1024, 512, 2048, 4096, 8192],
+                    hop_lengths=[ 256, 128,  512, 1024, 2048],
+                    win_lengths=[1024, 512, 2048, 4096, 8192],
+                )
+                logger.info("[E2E Model] Using MS-STFT discriminator (5 scales)")
+        except Exception as e:
+            logger.warning(f"[E2E Model] Could not build discriminator ({e}). "
+                           f"Inference-only mode — discriminators will be unavailable.")
 
         # Load pretrained disc weights (stashed during _load_vocoder_weights).
         # msd.* keys from old checkpoints will simply be skipped (strict=False).
