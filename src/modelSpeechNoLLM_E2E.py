@@ -52,6 +52,10 @@ class MMS_Speech_NoLLM_E2E_Config(MMS_Speech_NoLLM_Config):
         default="interpolation",
         metadata={"help": "Upsampling method: 'interpolation' (default), 'transposed_conv', or 'cross_attention'"}
     )
+    transconv_layers: int = field(
+        default=3,
+        metadata={"help": "Number of transposed conv layers when upsampling_method='transposed_conv'. 3 = 2x→2x→4x = 16x (new default). 2 = 2x→4x = 8x (old checkpoints)."}
+    )
 
 
 @register_model("MMS_Speech_NoLLM_E2E", dataclass=MMS_Speech_NoLLM_E2E_Config)

@@ -185,6 +185,10 @@ def load_model(checkpoint_path, manifest_dir, device, extract_ema=False):
         model_overrides["model"]["use_cqt"] = False
     if "upsampling_method" not in _model_dict:
         model_overrides["model"]["upsampling_method"] = "interpolation"
+    # Older checkpoints trained before transconv_layers flag existed used 2 layers (2x→4x=8x).
+    # New default is 3 layers. Force 2 for legacy checkpoints so architecture matches weights.
+    if "transconv_layers" not in _model_dict:
+        model_overrides["model"]["transconv_layers"] = 2
     del _ckpt_cfg, _model_cfg, _model_dict
 
     # EMA extraction: only pay for torch.load when --use-ema is requested.
