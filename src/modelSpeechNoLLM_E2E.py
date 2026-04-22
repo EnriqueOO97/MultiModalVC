@@ -114,11 +114,13 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         # =====================================================================
         self.use_cqt = cfg.use_cqt
 
-        # Discriminators are training-only. Wrap instantiation so that inference
-        # environments missing optional dependencies (e.g. nnAudio for CQT) can
-        # still load and run the generator without error.
+        # MPD: always available (no optional deps)
+        self.mpd = MultiPeriodDiscriminator()
+
+        # Spectral discriminator: CQT requires nnAudio (not installed on inference cluster).
+        # Catch only ImportError so that any other build failure (wrong hop_length, etc.)
+        # surfaces immediately rather than being silently swallowed.
         try:
-            self.mpd = MultiPeriodDiscriminator()
             if cfg.use_cqt:
                 self.cqtd = MultiScaleSubbandCQTDiscriminator()
                 logger.info("[E2E Model] Using CQT discriminator (5 scales)")
@@ -130,9 +132,9 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
                     win_lengths=[1024, 512, 2048, 4096, 8192],
                 )
                 logger.info("[E2E Model] Using MS-STFT discriminator (5 scales)")
-        except Exception as e:
-            logger.warning(f"[E2E Model] Could not build discriminator ({e}). "
-                           f"Inference-only mode — discriminators will be unavailable.")
+        except ImportError as e:
+            logger.warning(f"[E2E Model] Could not build spectral discriminator ({e}). "
+                           f"Inference-only mode — spectral discriminator will be unavailable.")
 
         # Load pretrained disc weights (stashed during _load_vocoder_weights).
         # msd.* keys from old checkpoints will simply be skipped (strict=False).

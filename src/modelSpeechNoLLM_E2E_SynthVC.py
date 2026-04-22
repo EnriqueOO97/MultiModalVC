@@ -68,9 +68,10 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         # Upsampling modules (only created for non-default methods)
         if cfg.upsampling_method == "transposed_conv":
             self.upsample_conv1 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
-            self.upsample_conv2 = nn.ConvTranspose1d(768, 768, kernel_size=8, stride=4, padding=2)
+            self.upsample_conv2 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
+            self.upsample_conv3 = nn.ConvTranspose1d(768, 768, kernel_size=8, stride=4, padding=2)
             self.upsample_act = nn.LeakyReLU(0.1)
-            logger.info("[SynthVC Model] Using transposed conv upsampling (2x → 4x = 8x)")
+            logger.info("[SynthVC Model] Using transposed conv upsampling (2x → 2x → 4x = 16x)")
         elif cfg.upsampling_method == "cross_attention":
             self.upsample_cross_attn = nn.MultiheadAttention(embed_dim=768, num_heads=1, batch_first=True)
             self.upsample_pos_proj = nn.Linear(768, 768)
@@ -276,6 +277,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
                 x_slice = x[i:i + 1, :, :av_lengths[i]]
                 x_slice = self.upsample_act(self.upsample_conv1(x_slice))
                 x_slice = self.upsample_act(self.upsample_conv2(x_slice))
+                x_slice = self.upsample_act(self.upsample_conv3(x_slice))
                 tgt_len = int(target_lengths[i].item())
                 logger.debug(f"[upsample] after_conv={x_slice.shape[-1]}, target={tgt_len}, "
                              f"residual_ratio={tgt_len / x_slice.shape[-1]:.2f}")

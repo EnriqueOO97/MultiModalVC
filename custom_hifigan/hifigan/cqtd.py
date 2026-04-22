@@ -16,8 +16,9 @@ class DiscriminatorCQT(nn.Module):
     Args:
         sample_rate: Audio sample rate (e.g. 16000).
         hop_length: CQT hop length in samples. Should be a multiple of the generator hop.
-        n_octaves: Number of octaves to cover. For 16kHz audio without upsampling, use 7
-                   to stay below Nyquist (32Hz * 2^7 = 4096Hz).
+        n_octaves: Number of octaves to cover. Use 8 with fmin=31.0 for near-full 16kHz coverage
+                   (31Hz * 2^8 = 7936Hz, safely below Nyquist=8000Hz). Requires hop_length divisible by 2^(n_octaves-1).
+        fmin: Lowest frequency in Hz. Default 31.0 gives ceiling of 7936Hz — close to Nyquist without exceeding it.
         bins_per_octave: Frequency bins per octave (12 = 1 per semitone).
         filters: Base number of conv filters.
         max_filters: Maximum number of conv filters.
@@ -34,6 +35,7 @@ class DiscriminatorCQT(nn.Module):
         hop_length: int = 480,
         n_octaves: int = 7,
         bins_per_octave: int = 24,
+        fmin: float = 31.0,
         filters: int = 32,
         max_filters: int = 1024,
         filters_scale: int = 1,
@@ -58,6 +60,7 @@ class DiscriminatorCQT(nn.Module):
         self.cqt_transform = features.cqt.CQT2010v2(
             sr=sample_rate,
             hop_length=hop_length,
+            fmin=fmin,
             n_bins=bins_per_octave * n_octaves,
             bins_per_octave=bins_per_octave,
             output_format="Complex",
@@ -187,9 +190,12 @@ class MultiScaleSubbandCQTDiscriminator(nn.Module):
     """Multi-scale CQT discriminator.
 
     Defaults are tuned for 16kHz speech with generator hop_length=160:
-      - hop_lengths are multiples of 160 for frame alignment
-      - n_octaves=7 (Nyquist-safe at 16kHz without upsampling)
-      - bins_per_octave decreases for coarser scales
+      - hop_lengths are all multiples of 128 (= 2^(8-1)), required for n_octaves=8
+      - n_octaves=8 with fmin=31.0Hz covers 31Hz * 2^8 = 7936Hz, near-full coverage safely below Nyquist=8000Hz
+      - bins_per_octave decreases for coarser scales (lower time resolution scales)
+
+    Divisibility check (hop must be divisible by 2^(n_octaves-1) = 128):
+      1024/128=8 ✓, 640/128=5 ✓, 512/128=4 ✓, 256/128=2 ✓, 128/128=1 ✓
 
     Args:
         sample_rate: Audio sample rate.
@@ -205,9 +211,10 @@ class MultiScaleSubbandCQTDiscriminator(nn.Module):
     def __init__(
         self,
         sample_rate: int = 16000,
-        hop_lengths: List[int] = [960, 640, 480, 320, 160],
-        n_octaves: List[int] = [7, 7, 6, 7, 6],
+        hop_lengths: List[int] = [1024, 640, 512, 256, 128],
+        n_octaves: List[int] = [8, 8, 8, 8, 8],
         bins_per_octaves: List[int] = [12, 18, 24, 36, 48],
+        fmin: float = 31.0,
         filters: int = 32,
         max_filters: int = 1024,
         filters_scale: int = 1,
@@ -222,6 +229,7 @@ class MultiScaleSubbandCQTDiscriminator(nn.Module):
                     hop_length=hop_lengths[i],
                     n_octaves=n_octaves[i],
                     bins_per_octave=bins_per_octaves[i],
+                    fmin=fmin,
                     filters=filters,
                     max_filters=max_filters,
                     filters_scale=filters_scale,

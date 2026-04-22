@@ -131,8 +131,8 @@ else
         optimization.lr=[2e-4] \
         optimizer._name=adam \
         +optimizer.weight_decay=0.01 \
-        optimization.max_update=600000 \
-        optimization.max_epoch=400 \
+        optimization.max_update=400000 \
+        optimization.max_epoch=500 \
         lr_scheduler._name=cosine \
         lr_scheduler.warmup_updates=2000 \
         distributed_training.distributed_world_size=${NGPUS} \
