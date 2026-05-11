@@ -53,8 +53,12 @@ class MMS_Speech_NoLLM_E2E_Config(MMS_Speech_NoLLM_Config):
         metadata={"help": "Upsampling method: 'interpolation' (default), 'transposed_conv', or 'cross_attention'"}
     )
     transconv_layers: int = field(
-        default=3,
+        default=2,
         metadata={"help": "Number of transposed conv layers when upsampling_method='transposed_conv'. 3 = 2x→2x→4x = 16x (new default). 2 = 2x→4x = 8x (old checkpoints)."}
+    )
+    cqt_bins_mode: str = field(
+        default="standard",
+        metadata={"help": "CQT bins_per_octaves preset. 'standard' = [12,18,24,36,48] (default). 'reduced' = [12,12,18,24,36] (less fine-scale freq discrimination, gentler discriminator)."}
     )
 
 
@@ -126,8 +130,12 @@ class MMS_Speech_NoLLM_E2E(MMS_Speech_NoLLM):
         # surfaces immediately rather than being silently swallowed.
         try:
             if cfg.use_cqt:
-                self.cqtd = MultiScaleSubbandCQTDiscriminator()
-                logger.info("[E2E Model] Using CQT discriminator (5 scales)")
+                if cfg.cqt_bins_mode == "reduced":
+                    cqt_bins_per_octaves = [12, 12, 18, 24, 36]
+                else:  # "standard"
+                    cqt_bins_per_octaves = [12, 18, 24, 36, 48]
+                self.cqtd = MultiScaleSubbandCQTDiscriminator(bins_per_octaves=cqt_bins_per_octaves)
+                logger.info(f"[E2E Model] Using CQT discriminator (5 scales, bins_mode={cfg.cqt_bins_mode}, bins_per_octaves={cqt_bins_per_octaves})")
             else:
                 self.msstftd = MultiScaleSTFTDiscriminator(
                     filters=32,

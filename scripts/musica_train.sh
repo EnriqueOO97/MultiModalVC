@@ -125,6 +125,7 @@ else
         +criterion.disc_pretrain=${DISC_PRETRAIN:-true} \
         criterion.use_multires_mel=${USE_MULTIRES_MEL:-true} \
         +model.use_cqt=${USE_CQT:-false} \
+        +model.cqt_bins_mode=${CQT_BINS_MODE:-standard} \
         +model.upsampling_method=${UPSAMPLING_METHOD:-interpolation} \
         optimization.update_freq=[3] \
         optimization.clip_norm=${CLIP_NORM:-20.0} \

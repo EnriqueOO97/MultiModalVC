@@ -178,18 +178,24 @@ def load_model(checkpoint_path, manifest_dir, device, extract_ema=False):
 
     # Ensure new config fields exist for older checkpoints that predate them.
     # This prevents OmegaConf merge failures on the primary loading path.
-    _ckpt_cfg = torch.load(checkpoint_path, map_location="cpu", weights_only=False).get("cfg", {})
+    _raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    _ckpt_cfg = _raw.get("cfg", {})
     _model_cfg = _ckpt_cfg.get("model", {}) if isinstance(_ckpt_cfg, dict) else getattr(_ckpt_cfg, "model", {})
     _model_dict = _model_cfg if isinstance(_model_cfg, dict) else OmegaConf.to_container(_model_cfg, resolve=True)
     if "use_cqt" not in _model_dict:
         model_overrides["model"]["use_cqt"] = False
     if "upsampling_method" not in _model_dict:
         model_overrides["model"]["upsampling_method"] = "interpolation"
-    # Older checkpoints trained before transconv_layers flag existed used 2 layers (2x→4x=8x).
-    # New default is 3 layers. Force 2 for legacy checkpoints so architecture matches weights.
-    if "transconv_layers" not in _model_dict:
-        model_overrides["model"]["transconv_layers"] = 2
-    del _ckpt_cfg, _model_cfg, _model_dict
+    # transconv_layers config flag was added AFTER both the 2-layer and 3-layer
+    # trainings started, so it's not saved in either's checkpoint config.
+    # Detect the true architecture by looking at the weights themselves:
+    # presence of upsample_conv3 ⇒ 3-layer, otherwise 2-layer.
+    _sd = _raw.get("model", {})
+    _has_conv3 = any(k.startswith("upsample_conv3.") for k in _sd.keys())
+    _has_conv1 = any(k.startswith("upsample_conv1.") for k in _sd.keys())
+    if _has_conv1:
+        model_overrides["model"]["transconv_layers"] = 3 if _has_conv3 else 2
+    del _raw, _ckpt_cfg, _model_cfg, _model_dict, _sd
 
     # EMA extraction: only pay for torch.load when --use-ema is requested.
     ema_state = None
