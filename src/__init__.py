@@ -16,3 +16,5 @@ from .criterionSpeechE2E import *
 from .task_synthvc import *
 from .modelSpeechNoLLM_E2E_SynthVC import *
 from .criterionSpeechE2E_SynthVC import *
+from .dataset_pathological_finetune import *
+from .task_pathological_finetune import *
