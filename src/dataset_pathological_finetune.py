@@ -35,7 +35,16 @@ from fairseq.data.fairseq_dataset import FairseqDataset
 from scipy.io import wavfile
 from transformers import WhisperProcessor
 
-from . import utils as custom_utils
+try:
+    from . import utils as custom_utils
+    _ = custom_utils.Compose  # verify it's src.utils, not fairseq.utils
+except (ImportError, ValueError, AttributeError):
+    import importlib.util
+    import os
+    _utils_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils.py")
+    _spec = importlib.util.spec_from_file_location("custom_utils", _utils_path)
+    custom_utils = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(custom_utils)
 
 logger = logging.getLogger(__name__)
 
@@ -318,4 +327,6 @@ class mms_pathological_finetune_dataset(FairseqDataset):
                 start = np.random.randint(0, diff + 1)
                 out[i] = a[start : start + audio_size]
                 audio_starts[i] = start
+        if out.dim() == 5:
+            out = out.permute((0, 4, 1, 2, 3)).contiguous()
         return out, padding_mask, audio_starts

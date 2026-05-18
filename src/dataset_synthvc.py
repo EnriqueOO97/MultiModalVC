@@ -34,7 +34,16 @@ import soundfile as sf
 
 DBG = True if len(sys.argv) == 1 else False
 
-from . import utils as custom_utils
+try:
+    from . import utils as custom_utils
+    _ = custom_utils.Compose  # verify it's src.utils, not fairseq.utils
+except (ImportError, ValueError, AttributeError):
+    import importlib.util
+    import os
+    _utils_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils.py")
+    _spec = importlib.util.spec_from_file_location("custom_utils", _utils_path)
+    custom_utils = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(custom_utils)
 
 logger = logging.getLogger(__name__)
 

@@ -80,6 +80,11 @@ class E2EGanLossSynthVCConfig(E2EGanLossConfig):
         default=True, metadata={"help": "Train discriminator during Phase 1 without adversarial gradient to generator. "
                                         "Warms up disc weights so it is ready when adversarial training starts."}
     )
+    freeze_disc: bool = field(
+        default=False, metadata={"help": "Freeze discriminator weights — skip disc optimizer/scheduler, keep loss_fm "
+                                        "and loss_gen_adv flowing to generator. For fine-tuning on small datasets "
+                                        "where the disc is already well-trained."}
+    )
 
 
 @register_criterion("e2e_gan_loss_synthvc", dataclass=E2EGanLossSynthVCConfig)
@@ -88,7 +93,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                  disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0,
                  disc_start_updates=30000, mel_num_mels=128, mel_hop_size=160,
                  disc_grad_clip=0.0, adv_warmup_updates=0, use_multires_mel=False,
-                 disc_lr_t_max=550000, disc_pretrain=True):
+                 disc_lr_t_max=550000, disc_pretrain=True, freeze_disc=False):
         super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas,
                          mel_num_mels=mel_num_mels, mel_hop_size=mel_hop_size)
         self.conv_loss_weight = conv_loss_weight
@@ -98,6 +103,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self.use_multires_mel = use_multires_mel
         self.disc_lr_t_max = disc_lr_t_max
         self.disc_pretrain = disc_pretrain
+        self.freeze_disc = freeze_disc
+        self._spec_disc = None  # lazy init in _lazy_init
         self.disc_lr_scheduler = None  # CosineAnnealingLR, created alongside disc_optimizer
         self._num_updates = 0
         # _disc_active_since is stored in *model* update units (fairseq optimizer steps),
@@ -118,7 +125,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                      f"disc_start_updates={self.disc_start_updates}, "
                      f"disc_grad_clip={self.disc_grad_clip}, adv_warmup_updates={self.adv_warmup_updates}, "
                      f"use_multires_mel={self.use_multires_mel}, disc_lr_t_max={self.disc_lr_t_max}, "
-                     f"disc_pretrain={self.disc_pretrain}, "
+                     f"disc_pretrain={self.disc_pretrain}, freeze_disc={self.freeze_disc}, "
                      f"mel_num_mels={mel_num_mels}, mel_hop_size={mel_hop_size}")
 
     def _is_disc_active(self, model=None):
@@ -153,53 +160,70 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 self._ema_state = {k: v.to(device) for k, v in self._ema_state.items()}
                 logger.info(f"[SynthVC EMA] Moved EMA state to {device}")
 
-        if self.disc_optimizer is None:
+        if self._spec_disc is None:
             # Spectral disc (MS-STFT or CQT) uses cuFFT internally — needs float32.
             # MPD works fine in bf16.
             self._use_cqt = hasattr(model, 'cqtd')
             self._spec_disc = model.cqtd if self._use_cqt else model.msstftd
             self._spec_disc.float()
-            # Collect discriminator params - enable grad for optimizer
-            disc_params = []
-            for param in model.mpd.parameters():
-                param.requires_grad = True
-                disc_params.append(param)
-            for param in self._spec_disc.parameters():
-                param.requires_grad = True
-                disc_params.append(param)
 
-            self.disc_optimizer = torch.optim.AdamW(
-                disc_params,
-                lr=self.disc_lr,
-                betas=self.disc_betas,
-            )
-            # Cosine LR decay for the discriminator.
-            # T_max is in num_updates units; we step the scheduler once per num_updates tick
-            # (see the disc step in forward()). min_lr = disc_lr / 10.
-            self.disc_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.disc_optimizer,
-                T_max=self.disc_lr_t_max,
-                eta_min=self.disc_lr / 10.0,
-            )
-            logger.info(f"[SynthVC Criterion] Initialized disc optimizer with lr={self.disc_lr}, "
-                       f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}, "
-                       f"cosine T_max={self.disc_lr_t_max}, eta_min={self.disc_lr/10.0}")
-
-            # Apply deferred disc_optimizer and scheduler states from checkpoint resume
-            if self._pending_disc_optimizer_state is not None:
-                try:
-                    self.disc_optimizer.load_state_dict(self._pending_disc_optimizer_state)
-                    logger.info("[SynthVC Criterion] Loaded deferred disc_optimizer state from checkpoint")
-                except Exception as e:
-                    logger.warning(f"[SynthVC Criterion] Failed to load disc_optimizer state: {e}")
+            if self.freeze_disc:
+                # Disc is frozen: no optimizer, no scheduler, params not trainable.
+                # The disc still runs in forward() so loss_fm and loss_gen_adv flow
+                # to the generator, but its weights stay fixed.
+                for param in model.mpd.parameters():
+                    param.requires_grad = False
+                for param in self._spec_disc.parameters():
+                    param.requires_grad = False
+                # Discard any pending optimizer/scheduler state from checkpoint —
+                # we're not building those optimizers.
                 self._pending_disc_optimizer_state = None
-            if self._pending_disc_scheduler_state is not None:
-                try:
-                    self.disc_lr_scheduler.load_state_dict(self._pending_disc_scheduler_state)
-                    logger.info("[SynthVC Criterion] Loaded deferred disc_lr_scheduler state from checkpoint")
-                except Exception as e:
-                    logger.warning(f"[SynthVC Criterion] Failed to load disc_lr_scheduler state: {e}")
                 self._pending_disc_scheduler_state = None
+                n_disc = sum(p.numel() for p in model.mpd.parameters()) + sum(p.numel() for p in self._spec_disc.parameters())
+                logger.info(f"[SynthVC Criterion] Disc FROZEN: weights not trainable, "
+                            f"no disc optimizer/scheduler created ({n_disc:,} params held fixed)")
+            else:
+                # Collect discriminator params - enable grad for optimizer
+                disc_params = []
+                for param in model.mpd.parameters():
+                    param.requires_grad = True
+                    disc_params.append(param)
+                for param in self._spec_disc.parameters():
+                    param.requires_grad = True
+                    disc_params.append(param)
+
+                self.disc_optimizer = torch.optim.AdamW(
+                    disc_params,
+                    lr=self.disc_lr,
+                    betas=self.disc_betas,
+                )
+                # Cosine LR decay for the discriminator.
+                # T_max is in num_updates units; we step the scheduler once per num_updates tick
+                # (see the disc step in forward()). min_lr = disc_lr / 10.
+                self.disc_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.disc_optimizer,
+                    T_max=self.disc_lr_t_max,
+                    eta_min=self.disc_lr / 10.0,
+                )
+                logger.info(f"[SynthVC Criterion] Initialized disc optimizer with lr={self.disc_lr}, "
+                           f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}, "
+                           f"cosine T_max={self.disc_lr_t_max}, eta_min={self.disc_lr/10.0}")
+
+                # Apply deferred disc_optimizer and scheduler states from checkpoint resume
+                if self._pending_disc_optimizer_state is not None:
+                    try:
+                        self.disc_optimizer.load_state_dict(self._pending_disc_optimizer_state)
+                        logger.info("[SynthVC Criterion] Loaded deferred disc_optimizer state from checkpoint")
+                    except Exception as e:
+                        logger.warning(f"[SynthVC Criterion] Failed to load disc_optimizer state: {e}")
+                    self._pending_disc_optimizer_state = None
+                if self._pending_disc_scheduler_state is not None:
+                    try:
+                        self.disc_lr_scheduler.load_state_dict(self._pending_disc_scheduler_state)
+                        logger.info("[SynthVC Criterion] Loaded deferred disc_lr_scheduler state from checkpoint")
+                    except Exception as e:
+                        logger.warning(f"[SynthVC Criterion] Failed to load disc_lr_scheduler state: {e}")
+                    self._pending_disc_scheduler_state = None
 
     def _init_ema(self, model):
         """Initialize EMA shadow copy using canonical (stripped) parameter names.
@@ -252,6 +276,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
 
         # Freeze upstream modules the first time Phase 2 activates
         if disc_active:
+            model._freeze_disc = self.freeze_disc
             model._freeze_for_phase2()
 
         subset_name = sample.get("subset_name", "train")
@@ -346,29 +371,30 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 gt_wav_f32 = gt_wav.float()
                 pred_wav_f32 = pred_wav.float()
 
-                # Discriminator step
-                self.disc_optimizer.zero_grad()
-                mpd_real_scores, _ = model.mpd(gt_wav)
-                msstftd_real_scores, _ = self._spec_disc(gt_wav_f32)
-                mpd_fake_scores, _ = model.mpd(pred_wav.detach())
-                msstftd_fake_scores, _ = self._spec_disc(pred_wav_f32.detach())
+                # Discriminator step (skipped when disc is frozen)
+                if not self.freeze_disc:
+                    self.disc_optimizer.zero_grad()
+                    mpd_real_scores, _ = model.mpd(gt_wav)
+                    msstftd_real_scores, _ = self._spec_disc(gt_wav_f32)
+                    mpd_fake_scores, _ = model.mpd(pred_wav.detach())
+                    msstftd_fake_scores, _ = self._spec_disc(pred_wav_f32.detach())
 
-                loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
-                loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
-                loss_disc = loss_disc_mpd + loss_disc_msstftd
-                loss_disc.backward()
+                    loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
+                    loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
+                    loss_disc = loss_disc_mpd + loss_disc_msstftd
+                    loss_disc.backward()
 
-                # Gradient clipping for discriminator
-                if self.disc_grad_clip > 0:
-                    disc_params = list(model.mpd.parameters()) + list(self._spec_disc.parameters())
-                    torch.nn.utils.clip_grad_norm_(disc_params, self.disc_grad_clip)
+                    # Gradient clipping for discriminator
+                    if self.disc_grad_clip > 0:
+                        disc_params = list(model.mpd.parameters()) + list(self._spec_disc.parameters())
+                        torch.nn.utils.clip_grad_norm_(disc_params, self.disc_grad_clip)
 
-                self.disc_optimizer.step()
-                # Step cosine LR scheduler once per optimizer (num_updates) step, not per
-                # criterion call — this keeps the schedule aligned with num_updates units.
-                if self.disc_lr_scheduler is not None and model_updates > getattr(self, "_disc_sched_last_update", -1):
-                    self.disc_lr_scheduler.step()
-                    self._disc_sched_last_update = model_updates
+                    self.disc_optimizer.step()
+                    # Step cosine LR scheduler once per optimizer (num_updates) step, not per
+                    # criterion call — this keeps the schedule aligned with num_updates units.
+                    if self.disc_lr_scheduler is not None and model_updates > getattr(self, "_disc_sched_last_update", -1):
+                        self.disc_lr_scheduler.step()
+                        self._disc_sched_last_update = model_updates
 
                 # Generator step
                 mpd_real_scores, mpd_real_feats = model.mpd(gt_wav)
@@ -380,6 +406,15 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 loss_gen_mpd, _ = generator_loss(mpd_fake_scores)
                 loss_gen_msstftd, _ = generator_loss(msstftd_fake_scores)
                 loss_gen_adv = loss_gen_mpd + loss_gen_msstftd
+
+                # When disc is frozen we never ran the disc-update block above, so
+                # `loss_disc` was never set.  Compute it here from the gen-step scores
+                # for logging only — no backward, no optimizer step.
+                if self.freeze_disc:
+                    with torch.no_grad():
+                        loss_disc_mpd, _, _ = discriminator_loss(mpd_real_scores, mpd_fake_scores)
+                        loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
+                        loss_disc = loss_disc_mpd + loss_disc_msstftd
 
                 # Adversarial warmup: linearly ramp adv weight from 0→1.
                 # Uses model.num_updates (not local _num_updates) so warmup position
@@ -435,7 +470,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 # cosine decay budget is reserved for Phase 2 adversarial training.
                 # =============================================================
                 loss_disc_pretrain = 0.0
-                if self.disc_pretrain:
+                if self.disc_pretrain and not self.freeze_disc:
                     # cuFFT (used by MS-STFT disc) does not support BFloat16.
                     # Only spectral disc needs float32 input; MPD stays in bf16.
                     gt_wav_f32 = gt_wav.float()
