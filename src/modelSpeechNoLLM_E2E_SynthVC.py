@@ -392,8 +392,10 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
 
         # =====================================================================
         # PHASE 2 / INFERENCE: Single synthetic-only pass through vocoder
+        # Also taken by the pathological finetune (model._force_single_pass=True),
+        # which is straightforward VC and must not run the Phase-1 dual pass.
         # =====================================================================
-        if disc_active or not self.training:
+        if disc_active or not self.training or getattr(self, '_force_single_pass', False):
             # Force modality to 'av' — no dropout during voice conversion
             mode = 'av'
 

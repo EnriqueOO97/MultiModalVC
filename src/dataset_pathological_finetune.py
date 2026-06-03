@@ -24,7 +24,6 @@ wav path by replacing ``.wav`` with ``_xvector.pt``.
 
 import logging
 import os
-import random
 import sys
 from typing import List, Optional, Union
 
@@ -45,6 +44,10 @@ except (ImportError, ValueError, AttributeError):
     _spec = importlib.util.spec_from_file_location("custom_utils", _utils_path)
     custom_utils = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(custom_utils)
+    # Register in sys.modules so spawned DataLoader workers (multi-GPU DDP uses the
+    # 'spawn' start method) can unpickle custom_utils.Compose — without this,
+    # `import custom_utils` fails in the fresh worker process. Harmless on 1 GPU.
+    sys.modules["custom_utils"] = custom_utils
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +127,7 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         image_aug: bool = False,
         modalities: Optional[List[str]] = None,
         subset_name: Optional[str] = None,
+        number_of_synths: int = 6,
     ):
         super().__init__()
         self.modalities = set(modalities) if modalities is not None else {"audio", "video"}
@@ -140,6 +144,22 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         self.shuffle = shuffle
         self.normalize = normalize
         self.max_sample_size = max_sample_size if max_sample_size is not None else sys.maxsize
+        self.number_of_synths = number_of_synths
+
+        # Deterministic (input, target) expansion — no random target selection.
+        # The healthy target (column index 0 of each target_list) is ALWAYS used.
+        # Synth targets 1..number_of_synths are appended in manifest order.
+        # Every pair is materialized, so each epoch and each validation pass sees
+        # the exact same complete set (trackable, no per-epoch target rotation).
+        self.index_map: List[tuple] = []
+        self.expanded_sizes: List[int] = []
+        for entry_idx in range(len(self.video_paths)):
+            n_avail_synths = len(self.target_lists[entry_idx]) - 1  # minus the healthy slot
+            n_use = max(0, min(self.number_of_synths, n_avail_synths))
+            target_indices = [0] + list(range(1, 1 + n_use))  # 0 == real healthy
+            for t_idx in target_indices:
+                self.index_map.append((entry_idx, t_idx))
+                self.expanded_sizes.append(self.sizes[entry_idx])
 
         self.subset = manifest_path.split("/")[-1].split(".")[0]
         self.subset_name = subset_name if subset_name is not None else self.subset
@@ -159,7 +179,12 @@ class mms_pathological_finetune_dataset(FairseqDataset):
                 custom_utils.CenterCrop((image_crop_size, image_crop_size)),
                 custom_utils.Normalize(image_mean, image_std),
             ])
-        logger.info(f"[pathological-finetune] subset={self.subset_name} image_aug={image_aug}")
+        logger.info(
+            f"[pathological-finetune] subset={self.subset_name} image_aug={image_aug} "
+            f"entries={len(self.video_paths)} number_of_synths={self.number_of_synths} "
+            f"-> {len(self.index_map)} (input,target) pairs "
+            f"({1 + min(self.number_of_synths, max(0, len(self.target_lists[0]) - 1))} targets/entry)"
+        )
 
     # ---------- helpers (mirror mms_synthvc_dataset) ----------
 
@@ -187,23 +212,24 @@ class mms_pathological_finetune_dataset(FairseqDataset):
     # ---------- core ----------
 
     def __getitem__(self, index):
+        # Flat index -> (manifest entry, target column). Deterministic, no random draw.
+        entry_idx, target_idx = self.index_map[index]
+
         # Video
         video_feats = None
         if "video" in self.modalities:
-            video_feats = self._load_video(self.video_paths[index])
+            video_feats = self._load_video(self.video_paths[entry_idx])
             video_feats = torch.from_numpy(video_feats.astype(np.float32))
 
         # Pathological audio -> goes into BOTH `audio_source` and `synth_audio_source`
         # slots so the model receives it whichever forward path it uses.
-        patho_path = self.patho_paths[index]
+        patho_path = self.patho_paths[entry_idx]
         patho_wav, sr = self._load_wav(patho_path)
         patho_len = int(len(patho_wav))
         patho_whisper = self._wav_to_whisper(patho_wav, sr)
 
-        # Pick 1 of 7 targets uniformly at random per __getitem__ call
-        target_paths = self.target_lists[index]
-        target_idx = random.randint(0, len(target_paths) - 1)
-        target_path = target_paths[target_idx]
+        # Deterministic target — target_idx 0 is the real healthy wav, 1..N are synths
+        target_path = self.target_lists[entry_idx][target_idx]
         target_wav, _ = self._load_wav(target_path)
         target_waveform = torch.from_numpy(target_wav).float()
 
@@ -213,7 +239,8 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         if spk_embedding.dim() > 1:
             spk_embedding = spk_embedding.squeeze()
 
-        fid = os.path.splitext(os.path.basename(patho_path))[0]
+        # fid carries the target column so paired (input, target) samples are distinguishable
+        fid = os.path.splitext(os.path.basename(patho_path))[0] + f"__t{target_idx}"
         # Speech rate is unused at training time — populate with a neutral placeholder
         sr_label = torch.tensor(0.0, dtype=torch.float32)
 
@@ -232,20 +259,20 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         }
 
     def __len__(self):
-        return len(self.sizes)
+        return len(self.index_map)
 
     def num_tokens(self, index):
-        return self.sizes[index]
+        return self.expanded_sizes[index]
 
     def size(self, index):
-        return self.sizes[index]
+        return self.expanded_sizes[index]
 
     def ordered_indices(self):
         if self.shuffle:
             order = [np.random.permutation(len(self))]
         else:
             order = [np.arange(len(self))]
-        order.append(self.sizes)
+        order.append(self.expanded_sizes)
         return np.lexsort(order)[::-1]
 
     # ---------- collater (matches mms_synthvc_dataset batch contract) ----------

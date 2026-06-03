@@ -33,6 +33,128 @@ if _HIFIGAN_PATH not in sys.path:
     sys.path.insert(0, _HIFIGAN_PATH)
 from hifigan.discriminator import feature_loss, discriminator_loss, generator_loss
 
+
+class MultiResolutionSTFTLoss(nn.Module):
+    """L1 on linear-magnitude STFT at multiple resolutions (spectral convergence
+    + log-magnitude L1, the standard Parallel-WaveGAN formulation).
+
+    Computes everything in float32 (cuFFT has no bf16 support). GT side is detached.
+    Windows are kept moderately large (no tiny hops) for robustness to the
+    imperfectly-aligned subset of the training data.
+    """
+    def __init__(self, resolutions=None):
+        super().__init__()
+        if resolutions is None:
+            # (n_fft, hop, win)
+            resolutions = [
+                (512, 128, 512),
+                (1024, 256, 1024),
+                (2048, 512, 2048),
+            ]
+        self.resolutions = resolutions
+        for i, (n_fft, hop, win) in enumerate(resolutions):
+            self.register_buffer(f"window_{i}", torch.hann_window(win), persistent=False)
+
+    def _stft_mag(self, wav, n_fft, hop, win, window):
+        pad = (n_fft - hop) // 2
+        wav = F.pad(wav, (pad, pad), mode="reflect")
+        spec = torch.stft(
+            wav, n_fft=n_fft, hop_length=hop, win_length=win,
+            window=window, center=False, return_complex=True,
+        )
+        mag = torch.abs(spec)
+        return torch.clamp(mag, min=1e-7)
+
+    def forward(self, pred_wav, gt_wav):
+        if pred_wav.dim() == 3:
+            pred_wav = pred_wav.squeeze(1)
+        if gt_wav.dim() == 3:
+            gt_wav = gt_wav.squeeze(1)
+        pred_wav = pred_wav.float()
+        gt_wav = gt_wav.float()
+
+        total = 0.0
+        for i, (n_fft, hop, win) in enumerate(self.resolutions):
+            window = getattr(self, f"window_{i}")
+            mp = self._stft_mag(pred_wav, n_fft, hop, win, window)
+            with torch.no_grad():
+                mg = self._stft_mag(gt_wav, n_fft, hop, win, window)
+            min_t = min(mp.size(-1), mg.size(-1))
+            mp = mp[..., :min_t]
+            mg = mg[..., :min_t]
+            sc = torch.norm(mg - mp, p="fro") / (torch.norm(mg, p="fro") + 1.0)
+            logmag = F.l1_loss(torch.log1p(mp), torch.log1p(mg))
+            total = total + sc + logmag
+        return total / len(self.resolutions)
+
+
+class DNSMOSProLoss(nn.Module):
+    """Perceptual loss using a frozen DNSMOSPro TorchScript model.
+
+    The generator's predicted waveform is scored by the frozen MOS predictor.
+    Training loss = mean(5 - score), minimised when score → 5 (perfect quality).
+    Validation metric = mean(score) directly (logged as dnsmos_score, range 1–5).
+
+    STFT is reimplemented in pure PyTorch (no librosa/numpy) so gradients flow
+    back through the spectrogram into the generator during training.
+    Model weights are permanently frozen and receive no gradients.
+
+    Input: 16 kHz mono waveform. Internally float32 (cuFFT has no bf16 support).
+    Parameters match the BVCC gin config: n_fft=320, hop=160, win=320, log-mag.
+    """
+
+    N_FFT      = 320
+    HOP_LENGTH = 160
+    WIN_LENGTH = 320
+
+    def __init__(self, checkpoint_path: str):
+        super().__init__()
+        self.checkpoint_path = checkpoint_path
+        self.dnsmos = None  # lazy: loaded on first forward (needs device)
+        self.register_buffer("_window", torch.hann_window(self.WIN_LENGTH), persistent=False)
+
+    def _load_model(self, device):
+        if self.dnsmos is None:
+            self.dnsmos = torch.jit.load(self.checkpoint_path, map_location=device)
+            self.dnsmos.eval()
+            for p in self.dnsmos.parameters():
+                p.requires_grad_(False)
+            logger_inner = logging.getLogger("src.criterionSpeechE2E_SynthVC")
+            logger_inner.info(f"[DNSMOSPro] loaded frozen model from {self.checkpoint_path}")
+
+    def _wav_to_spec(self, wav: torch.Tensor) -> torch.Tensor:
+        """wav: (B, T) float32 → spec: (B, 1, T_frames, 161) float32 log10-magnitude."""
+        window = self._window.to(wav.device)
+        spec = torch.stft(
+            wav,
+            n_fft=self.N_FFT,
+            hop_length=self.HOP_LENGTH,
+            win_length=self.WIN_LENGTH,
+            window=window,
+            center=True,
+            return_complex=True,
+        )                                              # (B, 161, T_frames)
+        mag = torch.abs(spec)                          # (B, 161, T_frames)
+        mag = torch.clamp(mag, min=1e-7, max=1e7)
+        logmag = torch.log10(mag)                      # (B, 161, T_frames)
+        logmag = logmag.transpose(1, 2)                # (B, T_frames, 161)
+        return logmag.unsqueeze(1)                     # (B, 1, T_frames, 161)
+
+    def score(self, pred_wav: torch.Tensor) -> torch.Tensor:
+        """Return predicted MOS mean for each sample. Shape: (B,), range ~[1, 5]."""
+        if pred_wav.dim() == 3:
+            pred_wav = pred_wav.squeeze(1)
+        pred_wav = pred_wav.float()
+        self._load_model(pred_wav.device)
+        spec = self._wav_to_spec(pred_wav)
+        out = self.dnsmos(spec)                        # (B, 2)
+        return out[:, 0]                               # MOS mean
+
+    def forward(self, pred_wav: torch.Tensor) -> torch.Tensor:
+        """Scalar training loss = mean(5 - MOS). Lower → better generator output."""
+        return (5.0 - self.score(pred_wav)).mean()
+
+
 logger = logging.getLogger("src.criterionSpeechE2E_SynthVC")
 
 # Exclude frozen encoders (never change → EMA = weights, wasteful) and
@@ -85,6 +207,30 @@ class E2EGanLossSynthVCConfig(E2EGanLossConfig):
                                         "and loss_gen_adv flowing to generator. For fine-tuning on small datasets "
                                         "where the disc is already well-trained."}
     )
+    reset_disc_schedule: bool = field(
+        default=False, metadata={"help": "On a fresh finetune_from_model, do NOT inherit the source checkpoint's "
+                                        "adversarial schedule state (_num_updates, _disc_active_since, "
+                                        "_adv_warmup_complete, disc optimizer/scheduler). Forces the disc "
+                                        "pretrain->adversarial schedule to start from zero so disc_start_updates and "
+                                        "adv_warmup_updates are honored relative to this run."}
+    )
+    use_mrstft_loss: bool = field(
+        default=False, metadata={"help": "Enable multi-resolution STFT reconstruction loss (generator-side)"}
+    )
+    mrstft_loss_weight: float = field(
+        default=2.0, metadata={"help": "Weight for MR-STFT loss (mel weight is ~30 for scale reference)"}
+    )
+    use_dnsmos_loss: bool = field(
+        default=False, metadata={"help": "Enable DNSMOSPro perceptual loss (frozen MOS predictor as generator loss)"}
+    )
+    dnsmos_loss_weight: float = field(
+        default=1.0, metadata={"help": "Weight for DNSMOSPro loss. Tune: if gnorm spikes on enable, halve it."}
+    )
+    dnsmos_checkpoint: str = field(
+        default="", metadata={"help": "Path to DNSMOSPro TorchScript checkpoint (.pt). "
+                                      "Also used as validation metric when model is initialised."}
+    )
+
 
 
 @register_criterion("e2e_gan_loss_synthvc", dataclass=E2EGanLossSynthVCConfig)
@@ -93,7 +239,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
                  disc_lr=2e-4, disc_betas="0.8,0.99", conv_loss_weight=5.0,
                  disc_start_updates=30000, mel_num_mels=128, mel_hop_size=160,
                  disc_grad_clip=0.0, adv_warmup_updates=0, use_multires_mel=False,
-                 disc_lr_t_max=550000, disc_pretrain=True, freeze_disc=False):
+                 disc_lr_t_max=550000, disc_pretrain=True, freeze_disc=False,
+                 reset_disc_schedule=False, use_mrstft_loss=False, mrstft_loss_weight=2.0,
+                 use_dnsmos_loss=False, dnsmos_loss_weight=1.0, dnsmos_checkpoint=""):
         super().__init__(task, mel_loss_weight, use_discriminator, disc_lr, disc_betas,
                          mel_num_mels=mel_num_mels, mel_hop_size=mel_hop_size)
         self.conv_loss_weight = conv_loss_weight
@@ -104,6 +252,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self.disc_lr_t_max = disc_lr_t_max
         self.disc_pretrain = disc_pretrain
         self.freeze_disc = freeze_disc
+        self.reset_disc_schedule = reset_disc_schedule
         self._spec_disc = None  # lazy init in _lazy_init
         self.disc_lr_scheduler = None  # CosineAnnealingLR, created alongside disc_optimizer
         self._num_updates = 0
@@ -113,6 +262,13 @@ class E2EGanLossSynthVC(E2EGanLoss):
         self._disc_active_since = None
         self._adv_warmup_complete = False   # once True, adv_weight stays 1.0 forever
         self.multires_mel = None  # lazy init
+        self.use_mrstft_loss = use_mrstft_loss
+        self.mrstft_loss_weight = mrstft_loss_weight
+        self.mrstft = None     # lazy init
+        self.use_dnsmos_loss = use_dnsmos_loss
+        self.dnsmos_loss_weight = dnsmos_loss_weight
+        self.dnsmos_checkpoint = dnsmos_checkpoint
+        self.dnsmos_model = None  # lazy init
         self._pending_disc_optimizer_state = None   # deferred disc optimizer state from checkpoint
         self._pending_disc_scheduler_state = None   # deferred disc LR scheduler state from checkpoint
         # Dummy parameter so fairseq's has_parameters() returns True and saves/loads
@@ -126,6 +282,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
                      f"disc_grad_clip={self.disc_grad_clip}, adv_warmup_updates={self.adv_warmup_updates}, "
                      f"use_multires_mel={self.use_multires_mel}, disc_lr_t_max={self.disc_lr_t_max}, "
                      f"disc_pretrain={self.disc_pretrain}, freeze_disc={self.freeze_disc}, "
+                     f"use_mrstft_loss={self.use_mrstft_loss}, mrstft_loss_weight={self.mrstft_loss_weight}, "
+                     f"use_dnsmos_loss={self.use_dnsmos_loss}, dnsmos_loss_weight={self.dnsmos_loss_weight}, "
                      f"mel_num_mels={mel_num_mels}, mel_hop_size={mel_hop_size}")
 
     def _is_disc_active(self, model=None):
@@ -152,6 +310,16 @@ class E2EGanLossSynthVC(E2EGanLoss):
         if self.use_multires_mel and self.multires_mel is None:
             self.multires_mel = MultiResolutionMelLoss(num_mels=self.mel_num_mels).to(device)
             logger.info(f"[SynthVC Criterion] Initialized multi-resolution mel loss (3 scales, {self.mel_num_mels} bands)")
+
+        if self.use_mrstft_loss and self.mrstft is None:
+            self.mrstft = MultiResolutionSTFTLoss().to(device)
+            logger.info("[SynthVC Criterion] Initialized MR-STFT loss")
+
+        # DNSMOSPro: initialised whenever a checkpoint path is provided.
+        # The model is always frozen. When use_dnsmos_loss=True it also contributes
+        # to the training loss; otherwise it is a validation-only metric.
+        if self.dnsmos_checkpoint and self.dnsmos_model is None:
+            self.dnsmos_model = DNSMOSProLoss(self.dnsmos_checkpoint).to(device)
 
         # Move EMA state to GPU after checkpoint load (checkpoints store EMA on CPU)
         if self._ema_initialized and self._ema_state:
@@ -274,8 +442,10 @@ class E2EGanLossSynthVC(E2EGanLoss):
         # Determine if disc is active
         disc_active = self._is_disc_active(model)
 
-        # Freeze upstream modules the first time Phase 2 activates
-        if disc_active:
+        # Freeze upstream modules the first time Phase 2 activates.
+        # The pathological finetune task owns its own freeze plan and signals
+        # this via model._finetune_owns_freeze — skip the legacy auto-freeze there.
+        if disc_active and not getattr(model, "_finetune_owns_freeze", False):
             model._freeze_disc = self.freeze_disc
             model._freeze_for_phase2()
 
@@ -342,6 +512,35 @@ class E2EGanLossSynthVC(E2EGanLoss):
             mel_gt = mel_gt[..., :mel_min_len]
 
             loss_mel = F.l1_loss(mel_pred, mel_gt)
+
+        # =====================================================================
+        # Auxiliary generator-side losses (MR-STFT + DNSMOSPro perceptual).
+        # Computed here so they feed into all three branches (disc-inactive,
+        # disc-active, validation). Default OFF — zero when disabled.
+        # =====================================================================
+        loss_mrstft = torch.tensor(0.0, device=pred_wav.device)
+        if self.use_mrstft_loss and self.mrstft is not None:
+            loss_mrstft = self.mrstft(pred_wav, gt_wav)
+
+        # DNSMOSPro perceptual loss: gradient only flows once the disc is active
+        # (generator is "ready"), mirroring the adversarial schedule. Before that,
+        # and during validation, the score is computed under no_grad as a metric only.
+        # The DNSMOS model weights are always frozen.
+        loss_dnsmos = torch.tensor(0.0, device=pred_wav.device)
+        dnsmos_score_val = torch.tensor(0.0, device=pred_wav.device)
+        if self.dnsmos_model is not None:
+            if model.training and self.use_dnsmos_loss and disc_active:
+                mos = self.dnsmos_model.score(pred_wav)
+                loss_dnsmos = (5.0 - mos).mean()
+                dnsmos_score_val = mos.detach().mean()
+            else:
+                with torch.no_grad():
+                    mos = self.dnsmos_model.score(pred_wav)
+                    dnsmos_score_val = mos.mean()
+
+        # aux_recon = reference-anchored reconstruction losses, applied in all branches.
+        # DNSMOS is added separately in the disc-active branch only, ramped by adv_weight.
+        aux_recon = self.mrstft_loss_weight * loss_mrstft
 
         # =====================================================================
         # Training: Phase-aware loss computation
@@ -430,7 +629,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
                         logger.info("[SynthVC Criterion] Adversarial warmup complete")
 
                 loss_gen = (self.mel_loss_weight * loss_mel
-                            + adv_weight * (loss_fm + loss_gen_adv))
+                            + aux_recon
+                            + adv_weight * (loss_fm + loss_gen_adv)
+                            + adv_weight * self.dnsmos_loss_weight * loss_dnsmos)
 
                 logging_output = {
                     "loss": loss_gen.item(),
@@ -441,6 +642,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss_fm": loss_fm.item(),
                     "loss_gen_adv": loss_gen_adv.item(),
                     "loss_disc": loss_disc.item(),
+                    "loss_mrstft": loss_mrstft.item(),
+                    "loss_dnsmos": loss_dnsmos.item(),
+                    "dnsmos_score": dnsmos_score_val.item(),
                     "adv_weight": adv_weight,
                     "disc_active": 1,
                     "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
@@ -461,7 +665,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                         canonical_features[:, :min_t, :].detach()
                     )
 
-                loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv
+                loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv + aux_recon
 
                 # =============================================================
                 # PHASE 1 DISC PRE-TRAINING: Train discriminator as a classifier
@@ -502,6 +706,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss_fm": 0.0,
                     "loss_gen_adv": 0.0,
                     "loss_disc": loss_disc_pretrain,
+                    "loss_mrstft": loss_mrstft.item(),
+                    "loss_dnsmos": loss_dnsmos.item(),
+                    "dnsmos_score": dnsmos_score_val.item(),
                     "disc_active": 0,
                     "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                     "sample_size": B,
@@ -542,7 +749,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     loss_disc_msstftd, _, _ = discriminator_loss(msstftd_real_scores, msstftd_fake_scores)
                     loss_disc = loss_disc_mpd + loss_disc_msstftd
 
-            loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv
+            loss_gen = self.mel_loss_weight * loss_mel + self.conv_loss_weight * loss_conv + aux_recon
 
             logging_output = {
                 "loss": loss_gen.item(),
@@ -553,6 +760,9 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 "loss_fm": loss_fm.item(),
                 "loss_gen_adv": loss_gen_adv.item(),
                 "loss_disc": loss_disc.item(),
+                "loss_mrstft": loss_mrstft.item(),
+                "loss_dnsmos": loss_dnsmos.item(),
+                "dnsmos_score": dnsmos_score_val.item(),
                 "disc_active": 1 if disc_active else 0,
                 "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                 "sample_size": B,
@@ -594,6 +804,30 @@ class E2EGanLossSynthVC(E2EGanLoss):
                         logging_output["ssim"] = 0.0
                 logging_output["val_mel_loss"] = loss_mel.item()
 
+                # Split MCD/SSIM by target type: healthy (fid ends with "__t0")
+                # vs synth (any other target column). Uses the primary mel rep so
+                # the two groups are computed identically regardless of multires.
+                utt_ids = sample.get("utt_id", []) or []
+                mp_primary = mel_pred.transpose(1, 2).float()
+                mg_primary = mel_gt.transpose(1, 2).float()
+                if len(utt_ids) == mp_primary.size(0):
+                    h_idx = [i for i, uid in enumerate(utt_ids) if str(uid).endswith("__t0")]
+                    s_idx = [i for i, uid in enumerate(utt_ids) if not str(uid).endswith("__t0")]
+                    for grp, idxs in (("healthy", h_idx), ("synth", s_idx)):
+                        if not idxs:
+                            continue  # group absent in this batch — omit (averaged only over present batches)
+                        sel = torch.tensor(idxs, device=mp_primary.device, dtype=torch.long)
+                        mp_g = mp_primary.index_select(0, sel)
+                        mg_g = mg_primary.index_select(0, sel)
+                        try:
+                            logging_output[f"mcd_{grp}"] = compute_mcd(mp_g, mg_g).item()
+                        except Exception:
+                            pass
+                        try:
+                            logging_output[f"ssim_{grp}"] = compute_ssim(mp_g, mg_g).item()
+                        except Exception:
+                            pass
+
             return loss_gen, B, logging_output
 
     def state_dict(self):
@@ -623,6 +857,34 @@ class E2EGanLossSynthVC(E2EGanLoss):
             logger.warning("[SynthVC Criterion] No criterion state in checkpoint "
                          "(first resume after checkpoint fix — disc_optimizer state not available)")
             return
+
+        # Fresh finetune: discard the source checkpoint's adversarial schedule so
+        # disc_start_updates / adv_warmup_updates are honored relative to THIS run.
+        # We still let the disc *weights* load (those live in the model state_dict),
+        # but drop the schedule counters and the disc optimizer/scheduler momentum.
+        if self.reset_disc_schedule:
+            for k in ("disc_active_since_v2", "disc_active_since", "adv_warmup_complete",
+                      "disc_optimizer_state", "disc_lr_scheduler_state", "disc_sched_last_update",
+                      "criterion_num_updates"):
+                state_dict.pop(k, None)
+            self._num_updates = 0
+            self._disc_active_since = None
+            self._adv_warmup_complete = False
+            self._pending_disc_optimizer_state = None
+            self._pending_disc_scheduler_state = None
+            self._disc_sched_last_update = -1
+            # EMA is still restored below (it's just a shadow of generator weights).
+            ema_state = state_dict.pop("ema_state", None)
+            super().load_state_dict(state_dict, strict=False)
+            if ema_state is not None:
+                cleaned_ema = {_ema_strip_module(k): v for k, v in ema_state.items()}
+                self._ema_state = cleaned_ema
+                self._ema_initialized = True
+                logger.info(f"[SynthVC Criterion] Restored EMA state ({len(cleaned_ema)} tensors)")
+            logger.info("[SynthVC Criterion] reset_disc_schedule=True — adversarial schedule starts fresh "
+                        "(_num_updates=0, _disc_active_since=None, warmup not complete, disc optimizer reset)")
+            return
+
         # disc_active_since_v2: in model update units (current format)
         disc_active_since_v2 = state_dict.pop("disc_active_since_v2", None)
         # disc_active_since (old key): was in criterion-call units, which reset to 0 on
@@ -666,7 +928,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
         metrics.log_scalar("loss", loss_sum / n_batches, priority=100, round=4)
 
-        for key in ["loss_mel", "loss_conv", "loss_mel_weighted", "loss_conv_weighted", "loss_fm", "loss_gen_adv", "loss_disc"]:
+        for key in ["loss_mel", "loss_conv", "loss_mel_weighted", "loss_conv_weighted", "loss_fm", "loss_gen_adv", "loss_disc", "loss_mrstft", "loss_dnsmos", "dnsmos_score"]:
             val_sum = sum(log.get(key, 0) for log in logging_outputs)
             metrics.log_scalar(key, val_sum / n_batches, priority=90, round=4)
 
@@ -695,6 +957,25 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 values = [log[key] for log in logging_outputs if key in log]
                 if values:
                     metrics.log_scalar(key, sum(values) / len(values), priority=priority, round=4)
+
+        # Per-target-type metrics: healthy vs synth (averaged over batches that
+        # contained that group). Lets you see if synth targets drag the score.
+        # mcd_healthy is also used as the best-checkpoint metric, and fairseq
+        # reads stats[best_checkpoint_metric] with a direct dict access at
+        # validation time — so it MUST exist whenever we validate.
+        is_validation = any("val_mel_loss" in log for log in logging_outputs)
+        for key, priority in [
+            ("mcd_healthy", 78), ("ssim_healthy", 68),
+            ("mcd_synth", 77), ("ssim_synth", 67),
+        ]:
+            values = [log[key] for log in logging_outputs if key in log]
+            if values:
+                metrics.log_scalar(key, sum(values) / len(values), priority=priority, round=4)
+            elif is_validation and key == "mcd_healthy":
+                # Safety net: guarantee the best-checkpoint metric is present so
+                # fairseq never KeyErrors. Large value => this validation is never
+                # selected as "best".
+                metrics.log_scalar(key, 1e9, priority=priority, round=4)
 
     @staticmethod
     def logging_outputs_can_be_summed() -> bool:
