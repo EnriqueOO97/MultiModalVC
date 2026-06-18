@@ -365,17 +365,13 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     lr=self.disc_lr,
                     betas=self.disc_betas,
                 )
-                # Cosine LR decay for the discriminator.
-                # T_max is in num_updates units; we step the scheduler once per num_updates tick
-                # (see the disc step in forward()). min_lr = disc_lr / 10.
-                self.disc_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    self.disc_optimizer,
-                    T_max=self.disc_lr_t_max,
-                    eta_min=self.disc_lr / 10.0,
-                )
-                logger.info(f"[SynthVC Criterion] Initialized disc optimizer with lr={self.disc_lr}, "
-                           f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}, "
-                           f"cosine T_max={self.disc_lr_t_max}, eta_min={self.disc_lr/10.0}")
+                # Discriminator LR is FLAT — no decay. Previously a CosineAnnealingLR
+                # (T_max=disc_lr_t_max, eta_min=disc_lr/10) slowly weakened the disc over
+                # the run while the generator LR stayed fixed; that asymmetry is removed so
+                # the disc keeps a constant learning rate. disc_lr_t_max is now unused.
+                self.disc_lr_scheduler = None
+                logger.info(f"[SynthVC Criterion] Initialized disc optimizer with lr={self.disc_lr} (flat, no decay), "
+                           f"betas={self.disc_betas}, params={sum(p.numel() for p in disc_params):,}")
 
                 # Apply deferred disc_optimizer and scheduler states from checkpoint resume
                 if self._pending_disc_optimizer_state is not None:
@@ -385,13 +381,8 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     except Exception as e:
                         logger.warning(f"[SynthVC Criterion] Failed to load disc_optimizer state: {e}")
                     self._pending_disc_optimizer_state = None
-                if self._pending_disc_scheduler_state is not None:
-                    try:
-                        self.disc_lr_scheduler.load_state_dict(self._pending_disc_scheduler_state)
-                        logger.info("[SynthVC Criterion] Loaded deferred disc_lr_scheduler state from checkpoint")
-                    except Exception as e:
-                        logger.warning(f"[SynthVC Criterion] Failed to load disc_lr_scheduler state: {e}")
-                    self._pending_disc_scheduler_state = None
+                # Disc LR scheduler removed (flat LR) — discard any saved scheduler state.
+                self._pending_disc_scheduler_state = None
 
     def _init_ema(self, model):
         """Initialize EMA shadow copy using canonical (stripped) parameter names.
@@ -480,6 +471,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
         pred_wav = net_output["waveform"]  # (B, 1, T_pred)
         canonical_features = net_output.get("canonical_features")  # (B, T, 512) or None
         target_features = net_output.get("target_features")        # (B, T, 512) or None
+        residual_ratio = net_output.get("residual_ratio")          # batch-mean tgt/conv_out, or None
 
         # =====================================================================
         # Mel loss (always computed: predicted waveform vs canonical ground truth)
@@ -644,7 +636,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss_disc": loss_disc.item(),
                     "loss_mrstft": loss_mrstft.item(),
                     "loss_dnsmos": loss_dnsmos.item(),
-                    "dnsmos_score": dnsmos_score_val.item(),
+                    "dnsmos_score": dnsmos_score_val.item(), "residual_ratio": residual_ratio,
                     "adv_weight": adv_weight,
                     "disc_active": 1,
                     "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
@@ -708,7 +700,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                     "loss_disc": loss_disc_pretrain,
                     "loss_mrstft": loss_mrstft.item(),
                     "loss_dnsmos": loss_dnsmos.item(),
-                    "dnsmos_score": dnsmos_score_val.item(),
+                    "dnsmos_score": dnsmos_score_val.item(), "residual_ratio": residual_ratio,
                     "disc_active": 0,
                     "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                     "sample_size": B,
@@ -762,7 +754,7 @@ class E2EGanLossSynthVC(E2EGanLoss):
                 "loss_disc": loss_disc.item(),
                 "loss_mrstft": loss_mrstft.item(),
                 "loss_dnsmos": loss_dnsmos.item(),
-                "dnsmos_score": dnsmos_score_val.item(),
+                "dnsmos_score": dnsmos_score_val.item(), "residual_ratio": residual_ratio,
                 "disc_active": 1 if disc_active else 0,
                 "num_updates": max(self._num_updates, getattr(model, "num_updates", 0) * 4),
                 "sample_size": B,
@@ -943,6 +935,14 @@ class E2EGanLossSynthVC(E2EGanLoss):
         adv_weight_vals = [log.get("adv_weight", -1) for log in logging_outputs if log.get("adv_weight", -1) >= 0]
         if adv_weight_vals:
             metrics.log_scalar("adv_weight", sum(adv_weight_vals) / len(adv_weight_vals), priority=83, round=4)
+
+        # Upsample interpolation ratio (avg tgt_len / conv_out_len over the epoch).
+        # >1 => interpolation is stretching (non-learnable frames invented);
+        # <1 => interpolation is compressing. Skips None (non-transposed-conv).
+        rr_values = [log["residual_ratio"] for log in logging_outputs
+                     if log.get("residual_ratio") is not None]
+        if rr_values:
+            metrics.log_scalar("residual_ratio", sum(rr_values) / len(rr_values), priority=82, round=4)
 
         # Single-res metrics
         for key, priority in [("mcd", 80), ("ssim", 70), ("val_mel_loss", 60)]:

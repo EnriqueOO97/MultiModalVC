@@ -86,6 +86,10 @@ class MMS_PathologicalFinetuneConfig(MMS_LLaMA_TrainingSynthVCConfig):
         default="",
         metadata={"help": "Path to an externally-finetuned Whisper checkpoint (HF dir containing model.safetensors, or a direct .safetensors file). Its encoder weights are swapped in at build time. Empty = stock openai/whisper-medium."},
     )
+    disc_init_checkpoint: str = field(
+        default="",
+        metadata={"help": "Optional fairseq checkpoint to warm-start ONLY the discriminator(s) (mpd./msstftd./cqtd.* keys). The generator side is ignored. Used to rescue a clean (bug-independent) discriminator when the rest of the model is cold-started. Empty = disc from scratch."},
+    )
 
 
 @register_task("MMS_LLaMA_pathological_finetune", dataclass=MMS_PathologicalFinetuneConfig)
@@ -137,6 +141,8 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
             modalities=self.cfg.modalities,
             subset_name=split,
             number_of_synths=self.cfg.number_of_synths,
+            noise_wav=self.cfg.noise_wav,
+            noise_prob=self.cfg.noise_prob,
         )
 
     def max_positions(self) -> Tuple[int, int]:
@@ -153,6 +159,7 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
         # whisper.* keys (trained runs), those override this swap — which is what
         # we want (saved weights win, external file is only the cold-start source).
         self._load_finetuned_whisper(model)
+        self._load_disc_init(model)
         self._apply_finetune_freeze_plan(model)
         # Tell the criterion that this task owns the freeze plan — its legacy
         # disc-activation auto-freeze must not run for this finetune.
@@ -198,8 +205,14 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
         """
         path = self.cfg.whisper_pretrained_path
         if not path:
-            logger.info("[finetune-whisper] whisper_pretrained_path empty — using stock openai/whisper-medium")
-            return
+            # Hard-fail rather than silently using stock openai/whisper-medium: this
+            # run REQUIRES the externally-finetuned Whisper encoder, and a silent HF
+            # fallback would train against the wrong weights without warning.
+            raise RuntimeError(
+                "[finetune-whisper] whisper_pretrained_path is empty. This run requires "
+                "the finetuned Whisper encoder; refusing to fall back to stock "
+                "openai/whisper-medium. Set task.whisper_pretrained_path explicitly."
+            )
 
         from safetensors.torch import load_file
 
@@ -225,6 +238,48 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
             logger.warning(f"[finetune-whisper] keys left at stock (missing in file): {list(missing)[:8]}")
         if unexpected:
             logger.warning(f"[finetune-whisper] ignored unexpected keys: {list(unexpected)[:8]}")
+
+    def _load_disc_init(self, model) -> None:
+        """Warm-start ONLY the discriminator(s) from a fairseq checkpoint.
+
+        The discriminators (mpd./msstftd./cqtd.*) only ever consume waveforms /
+        spectra — they are independent of the generator and of modality_fuse — so
+        they can be rescued from a checkpoint whose generator we otherwise discard.
+        Loads with strict=False (every non-disc key is reported missing and ignored);
+        shape mismatches still raise, which is the desired guard if the disc arch
+        differs.
+        """
+        import torch
+        from torch import nn
+
+        path = self.cfg.disc_init_checkpoint
+        if not path:
+            logger.info("[disc-init] disc_init_checkpoint empty — discriminator starts from scratch")
+            return
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"[disc-init] disc_init_checkpoint not found: {path}")
+
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        sd = state["model"] if isinstance(state, dict) and "model" in state else state
+        disc_prefixes = ("mpd.", "msstftd.", "cqtd.")
+        disc_state = {k: v for k, v in sd.items() if k.startswith(disc_prefixes)}
+        if not disc_state:
+            logger.warning(f"[disc-init] no discriminator tensors (mpd./msstftd./cqtd.*) found in {path}")
+            return
+
+        # Use nn.Module.load_state_dict directly: fairseq's override prunes/returns None.
+        missing, unexpected = nn.Module.load_state_dict(model, disc_state, strict=False)
+        # The model has disc params that weren't in the checkpoint? Surface them.
+        model_disc_keys = {n for n, _ in model.named_parameters() if n.startswith(disc_prefixes)}
+        loaded_keys = set(disc_state.keys())
+        disc_not_loaded = sorted(model_disc_keys - loaded_keys)
+        by_prefix = {p: sum(1 for k in disc_state if k.startswith(p)) for p in disc_prefixes}
+        logger.info(
+            f"[disc-init] loaded {len(disc_state)} discriminator tensors from {path} "
+            f"({ {p: c for p, c in by_prefix.items() if c} })"
+        )
+        if disc_not_loaded:
+            logger.warning(f"[disc-init] model disc params with no match in checkpoint (left at init): {disc_not_loaded[:8]}")
 
     def _apply_finetune_freeze_plan(self, model) -> None:
         """Apply per-module trainable flags to ``model`` based on this task's config.

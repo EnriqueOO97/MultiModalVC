@@ -5,4 +5,5 @@ __pycache__/
 *.png
 outputs/
 exp/
-manifest/
+manifest/pretrained_models/
+scripts/musica_submit_finetune.sh

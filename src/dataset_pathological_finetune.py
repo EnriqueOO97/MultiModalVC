@@ -22,14 +22,19 @@ xvectors are NOT in the manifest — they are derived from the chosen target's
 wav path by replacing ``.wav`` with ``_xvector.pt``.
 """
 
+import json
 import logging
+import multiprocessing as mp
 import os
+import random
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from typing import List, Optional, Union
 
 import cv2
 import numpy as np
 import torch
+import torchaudio
 from fairseq.data.fairseq_dataset import FairseqDataset
 from scipy.io import wavfile
 from transformers import WhisperProcessor
@@ -66,6 +71,57 @@ def _count_video_frames(path: str) -> int:
     return n if n > 0 else 1
 
 
+def _compute_sizes(full_paths: List[str], manifest_path: str) -> List[int]:
+    """Video frame count per clip, with a manifest-keyed on-disk cache.
+
+    ``cv2.VideoCapture`` opens are slow over a network FS (tens to hundreds of
+    ms each under load), and there are ~10^5 clips, so doing this sequentially
+    every launch stalls startup for hours. We therefore (a) probe in parallel
+    across all CPU cores, and (b) cache the result in a ``<manifest>.sizes.json``
+    sidecar keyed on the manifest's mtime + row count, so any relaunch with an
+    unchanged manifest reads sizes instantly instead of re-probing the videos.
+    """
+    cache_path = manifest_path + ".sizes.json"
+    n = len(full_paths)
+    try:
+        m_mtime = os.path.getmtime(manifest_path)
+    except OSError:
+        m_mtime = None
+
+    # Use a cached result only if it matches the current manifest exactly.
+    if m_mtime is not None and os.path.isfile(cache_path):
+        try:
+            with open(cache_path) as fh:
+                cached = json.load(fh)
+            if (cached.get("n") == n
+                    and abs(cached.get("manifest_mtime", -1) - m_mtime) < 1e-6
+                    and len(cached.get("sizes", [])) == n):
+                logger.info(f"[sizes] cache hit ({n} clips) <- {cache_path}")
+                return [int(x) for x in cached["sizes"]]
+        except Exception as e:
+            logger.warning(f"[sizes] ignoring unusable cache {cache_path}: {e}")
+
+    workers = min(64, (os.cpu_count() or 8))
+    logger.info(f"[sizes] probing {n} videos with {workers} workers "
+                f"(no valid cache) ...")
+    # 'spawn' avoids fork-related deadlocks with OpenCV's internal threads and a
+    # CUDA-initialized parent process.
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+        sizes = list(ex.map(_count_video_frames, full_paths, chunksize=256))
+
+    if m_mtime is not None:
+        try:
+            tmp = cache_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"n": n, "manifest_mtime": m_mtime, "sizes": sizes}, fh)
+            os.replace(tmp, cache_path)
+            logger.info(f"[sizes] cached {n} clips -> {cache_path}")
+        except Exception as e:
+            logger.warning(f"[sizes] could not write cache {cache_path}: {e}")
+    return sizes
+
+
 def load_pathological_manifest(manifest_path: str):
     """Parse the 9-column pathological fine-tune manifest.
 
@@ -93,9 +149,9 @@ def load_pathological_manifest(manifest_path: str):
     if not video_paths:
         raise RuntimeError(f"No entries in {manifest_path}")
 
-    for vp in video_paths:
-        full = vp if os.path.isabs(vp) else os.path.join(root, vp)
-        sizes.append(_count_video_frames(full))
+    full_paths = [vp if os.path.isabs(vp) else os.path.join(root, vp)
+                  for vp in video_paths]
+    sizes = _compute_sizes(full_paths, manifest_path)
 
     logger.info(
         f"Loaded {len(video_paths)} entries from {manifest_path} "
@@ -128,6 +184,9 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         modalities: Optional[List[str]] = None,
         subset_name: Optional[str] = None,
         number_of_synths: int = 6,
+        noise_wav: Optional[str] = None,
+        noise_prob: float = 0.0,
+        snr_levels: Optional[List[int]] = None,
     ):
         super().__init__()
         self.modalities = set(modalities) if modalities is not None else {"audio", "video"}
@@ -163,6 +222,26 @@ class mms_pathological_finetune_dataset(FairseqDataset):
 
         self.subset = manifest_path.split("/")[-1].split(".")[0]
         self.subset_name = subset_name if subset_name is not None else self.subset
+
+        # ---- noise injection (TRAIN split only, applied to the INPUT audio) ----
+        # Mirrors the MMS-LLaMA recipe: a fraction of training samples get babble
+        # noise mixed in at a randomly-chosen SNR. The target waveform stays clean,
+        # so the model learns to reconstruct clean speech from degraded audio (+video).
+        self.noise_prob = float(noise_prob)
+        self.snr_levels = list(snr_levels) if snr_levels is not None else [-10, -5, 0, 5, 10]
+        self.noise = None
+        if noise_wav and self.noise_prob > 0.0:
+            n_sr, n_wav = wavfile.read(noise_wav)
+            assert n_sr == 16_000, f"noise must be 16kHz, got {n_sr}"
+            if n_wav.dtype == np.int16:
+                n_wav = n_wav / 32768.0
+            n_wav = n_wav.astype(np.float32)
+            if n_wav.ndim > 1:
+                n_wav = n_wav.mean(axis=1)  # collapse to mono
+            self.noise = torch.from_numpy(n_wav).unsqueeze(0)  # (1, T_noise)
+            logger.info(f"[pathological-finetune] NOISE INJECTION enabled on subset="
+                        f"{self.subset_name!r}: file={noise_wav} p={self.noise_prob} "
+                        f"snr_levels={self.snr_levels}")
 
         self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
 
@@ -209,6 +288,20 @@ class mms_pathological_finetune_dataset(FairseqDataset):
             wav_data, sampling_rate=sample_rate, return_tensors="pt"
         ).input_features
 
+    def add_noise(self, wav: np.ndarray) -> np.ndarray:
+        """Mix babble noise into a 1-D float32 waveform at a random SNR."""
+        speech = torch.from_numpy(wav).unsqueeze(0)  # (1, T)
+        T = speech.shape[1]
+        noise = self.noise
+        if noise.shape[1] < T:                       # tile if the clip is longer than the noise
+            reps = T // noise.shape[1] + 1
+            noise = noise.repeat(1, reps)
+        start = random.randint(0, noise.shape[1] - T)
+        noise_seg = noise[:, start:start + T]
+        snr = torch.tensor([random.choice(self.snr_levels)], dtype=torch.float32)
+        noisy = torchaudio.functional.add_noise(speech, noise_seg, snr)
+        return noisy.squeeze(0).numpy().astype(np.float32)
+
     # ---------- core ----------
 
     def __getitem__(self, index):
@@ -225,6 +318,13 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         # slots so the model receives it whichever forward path it uses.
         patho_path = self.patho_paths[entry_idx]
         patho_wav, sr = self._load_wav(patho_path)
+        # Train-only noise injection on the INPUT audio (target stays clean).
+        # getattr guards make this robust if a dataset object was constructed by an
+        # older __init__ that predates the noise attributes (e.g. a live job whose
+        # workers re-import this file mid-run) — it simply skips injection.
+        if (getattr(self, "noise", None) is not None and self.subset_name == "train"
+                and np.random.rand() < getattr(self, "noise_prob", 0.0)):
+            patho_wav = self.add_noise(patho_wav)
         patho_len = int(len(patho_wav))
         patho_whisper = self._wav_to_whisper(patho_wav, sr)
 

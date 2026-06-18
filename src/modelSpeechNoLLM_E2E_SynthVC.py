@@ -67,7 +67,13 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
 
         # Upsampling modules (only created for non-default methods)
         if cfg.upsampling_method == "transposed_conv":
-            if cfg.transconv_layers == 3:
+            if cfg.transconv_layers == 4:
+                self.upsample_conv1 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
+                self.upsample_conv2 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
+                self.upsample_conv3 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
+                self.upsample_conv4 = nn.ConvTranspose1d(768, 768, kernel_size=8, stride=4, padding=2)
+                logger.info("[SynthVC Model] Using transposed conv upsampling (2x → 2x → 2x → 4x = 32x)")
+            elif cfg.transconv_layers == 3:
                 self.upsample_conv1 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
                 self.upsample_conv2 = nn.ConvTranspose1d(768, 768, kernel_size=4, stride=2, padding=1)
                 self.upsample_conv3 = nn.ConvTranspose1d(768, 768, kernel_size=8, stride=4, padding=2)
@@ -77,7 +83,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
                 self.upsample_conv2 = nn.ConvTranspose1d(768, 768, kernel_size=8, stride=4, padding=2)
                 logger.info("[SynthVC Model] Using transposed conv upsampling (2x → 4x = 8x) [legacy 2-layer]")
             else:
-                raise ValueError(f"transconv_layers must be 2 or 3, got {cfg.transconv_layers}")
+                raise ValueError(f"transconv_layers must be 2, 3 or 4, got {cfg.transconv_layers}")
             self.upsample_act = nn.LeakyReLU(0.1)
         elif cfg.upsampling_method == "cross_attention":
             self.upsample_cross_attn = nn.MultiheadAttention(embed_dim=768, num_heads=1, batch_first=True)
@@ -280,17 +286,24 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         x_up = x.new_zeros((B, C, max_target_len))
 
         if self.cfg.upsampling_method == "transposed_conv":
+            _residual_ratios = []  # tgt_len / conv_out_len per sample (>1 interp stretches, <1 compresses)
             for i in range(B):
                 x_slice = x[i:i + 1, :, :av_lengths[i]]
                 x_slice = self.upsample_act(self.upsample_conv1(x_slice))
                 x_slice = self.upsample_act(self.upsample_conv2(x_slice))
-                if self.cfg.transconv_layers == 3:
+                if self.cfg.transconv_layers >= 3:
                     x_slice = self.upsample_act(self.upsample_conv3(x_slice))
+                if self.cfg.transconv_layers >= 4:
+                    x_slice = self.upsample_act(self.upsample_conv4(x_slice))
                 tgt_len = int(target_lengths[i].item())
+                _residual_ratios.append(tgt_len / x_slice.shape[-1])
                 logger.debug(f"[upsample] after_conv={x_slice.shape[-1]}, target={tgt_len}, "
                              f"residual_ratio={tgt_len / x_slice.shape[-1]:.2f}")
                 x_i = F.interpolate(x_slice, size=tgt_len, mode='linear', align_corners=False)
                 x_up[i, :, :tgt_len] = x_i[0]
+            # Stash the batch-mean ratio so the criterion can average it per epoch.
+            if _residual_ratios:
+                self._last_residual_ratio = float(sum(_residual_ratios) / len(_residual_ratios))
 
         elif self.cfg.upsampling_method == "cross_attention":
             x_t = x.transpose(1, 2)  # (B, T, C) for cross-attention
@@ -448,6 +461,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
                 "target_lengths": target_lengths,
                 "canonical_features": None,
                 "target_features": None,
+                "residual_ratio": getattr(self, "_last_residual_ratio", None),
             }
 
         # =====================================================================
@@ -507,4 +521,5 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
             "target_lengths": target_lengths,        # (B,)
             "canonical_features": canonical_features, # (B, T, 512)
             "target_features": target_features,      # (B, T, 512) or None
+            "residual_ratio": getattr(self, "_last_residual_ratio", None),
         }
