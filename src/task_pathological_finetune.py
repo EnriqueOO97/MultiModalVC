@@ -317,13 +317,20 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
                 self.cfg.vocoder_trainable,
                 ("vocoder_", "_full_vocoder."),
             ),
+            # mel_head is the LIVE output head in MelVC (512 -> mel bands). Trainable
+            # by default; the knob lets the head-only salvage be explicit. (In the
+            # E2E/SynthVC pipelines this head is dead code, but leaving it trainable
+            # there is harmless — those forwards never touch it, so it gets no grad.)
+            "mel_head": (
+                getattr(self.cfg, "mel_head_trainable", True),
+                ("mel_head.",),
+            ),
         }
 
         always_frozen_prefixes = (
             "avhubert.",
             "whisper.",          # re-opened selectively below if whisper_top_n > 0
             "sr_predictor.",
-            "mel_head.",         # bypassed in E2E forward pass — dead branch
             "mpd.", "msstftd.", "cqtd.",  # disc params managed by criterion
         )
 
