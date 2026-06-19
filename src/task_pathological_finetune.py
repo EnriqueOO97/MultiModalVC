@@ -178,21 +178,25 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
         logger.info(
             "[finetune-freeze] forced single-pass forward; modality dropout disabled (p_av=1.0)"
         )
-        # Recompute freeze_params from the ACTUAL post-freeze-plan requires_grad
-        # state (the model's __init__ computed it before this plan ran, so it was
-        # stale — that's why trainable top-N whisper layers were never saved).
-        # Additionally, ALWAYS keep whisper.* out of the frozen-exclusion list so
-        # the entire encoder (external-finetuned + any trainable top-N) is written
-        # into every checkpoint. This makes inference self-contained: the saved
-        # checkpoint carries the exact whisper used during training, with no
-        # dependence on the external file or stock openai/whisper-medium at load.
+        # Decide what to EXCLUDE from the saved checkpoint. Exclude ONLY the modules
+        # that are deterministically REBUILT at load time:
+        #   * avhubert      -> rebuilt from w2v_path in build_model
+        #   * sr_predictor  -> reloaded from its fixed pretrained file in __init__
+        # Everything else is persisted — including a frozen backbone in a head-only
+        # salvage (its weights live nowhere else) and the finetuned whisper. This is
+        # what makes EVERY checkpoint self-contained: the earlier "exclude all frozen"
+        # rule stripped the frozen backbone in salvage runs, so those checkpoints were
+        # missing conformer/Qformer/proj and could not be used for inference alone.
+        # named_parameters() excludes buffers, so BatchNorm running stats (incl. the
+        # drifted avhubert stats the model adapted to) are still saved.
+        _SAVE_EXCLUDE = ("avhubert.", "sr_predictor.")
         model.freeze_params = [
-            n for n, p in model.named_parameters()
-            if not p.requires_grad and not n.startswith("whisper.")
+            n for n, _ in model.named_parameters() if n.startswith(_SAVE_EXCLUDE)
         ]
         logger.info(
-            f"[finetune-freeze] recomputed freeze_params: {len(model.freeze_params)} keys "
-            f"excluded from save; whisper.* is always persisted"
+            f"[finetune-freeze] save-excludes {len(model.freeze_params)} param keys "
+            f"(avhubert + sr_predictor, both rebuilt at load); everything else "
+            f"persisted -> self-contained checkpoint"
         )
         return model
 

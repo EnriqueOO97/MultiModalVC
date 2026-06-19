@@ -1,43 +1,29 @@
 #!/bin/bash
 # ============================================================
-# MelVC launch — VSC-5 Node B (zen3_0512_a100x2: 2x A100 40GB, 64/128 cores, 512GB).
-# Self-contained, single-node. Mel-output model + pure L1 mel loss.
+# MelVC (Musica/SLURM) — single self-contained launch script.
+# Mel-output model (BigVGAN-format mels) + pure L1 mel loss.
+# No vocoder training, no discriminator, no adversarial.
 #
-# This is the VSC-5 sibling of melvc-MUSICA.sh. Only cluster-specific bits differ:
-#   - SLURM header (A100 partition/qos, gpu:2, cpus-per-task=64)
-#   - UPDATE_FREQ default 2  (2 GPUs x 24 x 2 = effective batch 96, matching the
-#     original 4 GPUs x 24 x 1 run — so the LR stays 3e-5, no retune needed)
-#   - optional node-local NVMe data staging (STAGE_DATA=true)
-#
-# >>> EDIT the three PATHS marked  # <-- EDIT  before first use. <<<
-#
-# Submit:   sbatch scripts/melvc-NODEB.sh
+# Submit:   sbatch scripts/melvc-MUSICA.sh
 # Override anything via env, e.g.:
-#   RUN_NAME=melvc_v1_nodeB LR=3e-5 sbatch scripts/melvc-NODEB.sh
-#
-# Head-only salvage (rescue a buggy pre-fix checkpoint, head-only training):
-#   RUN_NAME=melvc_v1_headsalvage \
-#   FINETUNE_FROM_MODEL=<run>/checkpoints/checkpoint_best.pt \
-#   AFEAT_TRAINABLE=false FUSION_TRAINABLE=false QFORMER_TRAINABLE=false \
-#   PROJ_TRAINABLE=false CONFORMER_TRAINABLE=false WHISPER_TOP_N=0 \
-#   MEL_HEAD_TRAINABLE=true LR=1e-3 WARMUP_UPDATES=50 MAX_EPOCH=3 \
-#   BATCH_SIZE=24 UPDATE_FREQ=2 sbatch scripts/melvc-NODEB.sh
+#   RUN_NAME=melvc_v1 FINETUNE_DATA=/path LR=3e-5 sbatch scripts/melvc-MUSICA.sh
 # ============================================================
-#SBATCH --job-name=melvc
+#ASC --vanilla
+#SBATCH --job-name=mms_musica
 #SBATCH -N 1
-#SBATCH --partition zen3_0512_a100x2
-#SBATCH --qos zen3_0512_a100x2
-#SBATCH --gres=gpu:2
-#SBATCH --ntasks-per-node=1               # one launcher; fairseq spawns the 2 GPU procs itself
-#SBATCH --cpus-per-task=64                # all physical cores of the A100 node -> dataloader
-#SBATCH --time=72:00:00                   # 72h hard limit on VSC-5 (24h default)
+#SBATCH --gres=gpu:4
+#SBATCH -p zen4_0768_h100x4
+#SBATCH --qos zen4_0768_h100x4
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=88               # Request all CPUs for the node
+#SBATCH --time=72:00:00                 # Max limit on Musica
 #SBATCH --output=/tmp/slurm_%j_out.log
 #SBATCH --error=/tmp/slurm_%j_err.log
 set -e
 
 # ---------- PATHS (EDIT for the new cluster) ----------
-ROOT=/path/to/MultiModalVC                                                   # <-- EDIT
-FINETUNE_DATA=${FINETUNE_DATA:-/path/to/pre-trainVoxcelebYoutube}            # <-- EDIT
+ROOT=/data/fs201163/eo49197/MultiModalVC                                                 # <-- EDIT
+FINETUNE_DATA=${FINETUNE_DATA:-/data/fs201163/eo49197/VoiceConversion-fwf/pre-trainVoxcelebYoutube}            # <-- EDIT
 WHISPER_PRETRAINED_PATH=${WHISPER_PRETRAINED_PATH:-$ROOT/pretrained_models/whisper-medium/checkpoint-2900}
 W2V_PATH=${W2V_PATH:-$ROOT/pretrained_models/avhubert/large_vox_iter5.pt}
 
@@ -180,6 +166,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} fairseq-hydra-train \
     dataset.required_batch_size_multiple=1 \
     dataset.valid_subset=valid \
     dataset.validate_interval=${VALIDATE_INTERVAL:-1} \
+    dataset.validate_interval_updates=${VALIDATE_INTERVAL_UPDATES:-0} \
     hydra.run.dir=${OUT_PATH} \
     common.user_dir=${ROOT}/src \
     common.fp16=false \

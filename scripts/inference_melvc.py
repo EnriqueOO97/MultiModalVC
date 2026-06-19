@@ -31,7 +31,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from scipy.io import wavfile
-from transformers import WhisperProcessor
+from transformers import WhisperFeatureExtractor
 from fairseq import checkpoint_utils
 from omegaconf import OmegaConf
 
@@ -81,7 +81,7 @@ logger = logging.getLogger("melvc-inference")
 # ---------------------------------------------------------------------------
 # Default paths. Override any of these on the command line.
 # ---------------------------------------------------------------------------
-DEFAULT_CHECKPOINT = "/data/fs201163/eo49197/MultiModalVC/exp/multiModalVC-synth/melvc_v2/checkpoints/checkpoint44.pt"
+DEFAULT_CHECKPOINT = "/data/fs201163/eo49197/MultiModalVC/exp/multiModalVC-synth/melvc_v1_headsalvage_complete/checkpoints/checkpoint_best.pt"
 # Code repo (architecture). Added to sys.path so `import bigvgan` works.
 DEFAULT_BIGVGAN_CODE_DIR = "/data/fs201163/eo49197/BigVGAN"
 # Weights dir: a local folder holding `config.json` + `bigvgan_generator.pt`
@@ -292,7 +292,12 @@ def run_inference(args):
 
     model = load_model(args.checkpoint, manifest_dir, device)
     vocoder = load_bigvgan(args.bigvgan_code_dir, args.bigvgan_ckpt_dir, device)
-    whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
+    # Audio -> 80-mel log-spectrogram (the encoder's input). Constructed locally
+    # with whisper-medium params: NO HF download, NO weights, fully offline. The
+    # whisper *weights* come only from the checkpoint (enforced in load_model).
+    whisper_fe = WhisperFeatureExtractor(
+        feature_size=80, sampling_rate=16000, hop_length=160, chunk_length=30, n_fft=400,
+    )
 
     # Image transform — values from the MelVC / SynthVC config.
     video_transform = Compose([
@@ -381,7 +386,7 @@ def run_inference(args):
                 continue
 
             video_tensor, padding_mask = _to_video_tensor(chunk_frames, video_transform, device)
-            whisper_feats = whisper_processor(
+            whisper_feats = whisper_fe(
                 chunk_wav, sampling_rate=16000, return_tensors="pt"
             ).input_features.to(device)                            # (1,80,3000)
 
