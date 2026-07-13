@@ -67,6 +67,10 @@ criterion:
   win_size: 1024
   fmin: 0
   fmax: 8000
+  # Task-2 warp loss (default off): soft-DTW added alongside mel L1; duration loss.
+  softdtw_weight: 0.0
+  softdtw_gamma: 0.1
+  dur_loss_weight: 0.0
 
 optimization:
   max_epoch: 20000
@@ -133,6 +137,12 @@ model:
   bigvgan_hop: 256
   bigvgan_sr: 22050
   source_sr: 16000
+  ##### Task-1 length + Task-2 warp (default OFF -> current behaviour) #####
+  use_content_xattn: false
+  content_interleave_start: odd
+  use_duration_predictor: false
+  dur_pred_layers: 2
+  dur_r_min: 0.5
   stage1_checkpoint: ???
   vocoder_checkpoint: ???
   freeze_stage1: true

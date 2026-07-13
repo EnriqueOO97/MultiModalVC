@@ -47,6 +47,22 @@ class MMS_Speech_NoLLM_MelVC_Config(MMS_Speech_NoLLM_E2E_SynthVC_Config):
     bigvgan_hop: int = field(default=256, metadata={"help": "BigVGAN hop (for inference-time tgt_len fallback)."})
     bigvgan_sr: int = field(default=22050, metadata={"help": "BigVGAN sample rate."})
     source_sr: int = field(default=16000, metadata={"help": "Dataset audio sample rate."})
+    use_discriminator: bool = field(default=False, metadata={
+        "help": "Attach the mel-domain U-Net discriminator (Guo 2022) for adversarial "
+                "mel training. Disc weights live in the model (checkpointed); the "
+                "criterion owns its optimizer and the warmup/ramp schedule."})
+    # --- Task-2 warp: interleaved content cross-attn in the conformer (default OFF) ---
+    use_content_xattn: bool = field(default=False, metadata={
+        "help": "Interleave content cross-attn into the conformer (odd/even blocks "
+                "swap self-attn for cross-attn to Q-Former content tokens)."})
+    content_interleave_start: str = field(default="odd", metadata={
+        "help": "'odd' → 1-based blocks 1,3,5,... get content cross-attn."})
+    # --- Task-1 length: duration predictor (default OFF) ---
+    use_duration_predictor: bool = field(default=False, metadata={
+        "help": "Predict N (mel frames) at inference from content tokens + target spk."})
+    dur_pred_layers: int = field(default=2, metadata={"help": "Duration predictor transformer layers."})
+    dur_r_min: float = field(default=0.5, metadata={
+        "help": "Min output/input ratio: N in [r_min*L_in, L_in]. Never slower than input."})
 
 
 @register_model("MMS_Speech_NoLLM_MelVC", dataclass=MMS_Speech_NoLLM_MelVC_Config)
@@ -98,7 +114,57 @@ class MMS_Speech_NoLLM_MelVC(MMS_Speech_NoLLM_E2E_SynthVC):
         nn.init.xavier_uniform_(self.mel_head.weight)
         nn.init.constant_(self.mel_head.bias, 0.0)
         logger.info(f"[MelVC] mel_head 512 -> {self.mel_bands} bands; "
-                    f"vocoder deleted (single-pass mel output, no disc).")
+                    f"vocoder deleted (single-pass mel output).")
+
+        # Optional mel-domain discriminator (adversarial training). Held here so its
+        # weights are checkpointed with the model; the criterion manages its optimizer.
+        if getattr(cfg, "use_discriminator", False):
+            from .mel_discriminator import MelTFDiscriminator
+            self.mel_disc = MelTFDiscriminator()
+            logger.info("[MelVC] mel-domain U-Net discriminator attached (Guo 2022).")
+
+        # --- Task-2 warp: rebuild the conformer with interleaved content cross-attn ---
+        # (trains from scratch, so replacing the parent-built conformer is free.)
+        qformer_dim = int(getattr(cfg, "qformer_dim", 1024))
+        if getattr(cfg, "use_content_xattn", False):
+            from .divise_conformer.encoder_xattn import ConformerEncoderWithCrossAttn
+            self.content_proj = nn.Linear(qformer_dim, 512)
+            self.conformer = ConformerEncoderWithCrossAttn(
+                size="L", use_content_xattn=True,
+                content_interleave_start=getattr(cfg, "content_interleave_start", "odd"))
+            logger.info("[MelVC] content cross-attn ON (interleaved conformer blocks).")
+
+        # --- Task-1 length: duration predictor ---
+        self.dur_r_min = float(getattr(cfg, "dur_r_min", 0.5))
+        self._dur_loss = None
+        if getattr(cfg, "use_duration_predictor", False):
+            from .sub_model.modules import DurationPredictor
+            self.duration_predictor = DurationPredictor(
+                content_dim=qformer_dim, spk_dim=512,
+                num_layers=int(getattr(cfg, "dur_pred_layers", 2)), r_min=self.dur_r_min)
+            logger.info("[MelVC] duration predictor ON (predicts N at inference).")
+
+    def _maybe_predict_duration(self, content_tokens, query_lengths, spk_emb,
+                                video_lengths, target_lengths, max_target_len):
+        """Predict N = L_in * ratio. Train: teacher-force GT N, stash L_dur.
+        Inference: override target_lengths with the prediction. Fully detached."""
+        if getattr(self, "duration_predictor", None) is None:
+            return target_lengths, max_target_len
+        device = content_tokens.device
+        frame_rate = float(self.cfg.bigvgan_sr) / float(self.cfg.bigvgan_hop)  # ~86.13 Hz
+        L_in = (torch.tensor(video_lengths, dtype=torch.float32, device=device)
+                / 25.0 * frame_rate).clamp(min=1.0)               # input mel frames
+        spk = (spk_emb.detach() if spk_emb is not None
+               else content_tokens.new_zeros(content_tokens.size(0), 512))
+        ratio = self.duration_predictor(content_tokens.detach(), spk).float()  # (B,) in (r_min,1)
+        if torch.is_grad_enabled():
+            gt = target_lengths.to(device=device, dtype=torch.float32)
+            ratio_tgt = torch.clamp(gt / L_in, self.dur_r_min, 1.0)
+            self._dur_loss = torch.abs(ratio - ratio_tgt).mean()
+            return target_lengths, max_target_len                 # teacher forcing
+        self._dur_loss = None
+        N = torch.clamp((L_in * ratio).round().long(), min=1)
+        return N, int(N.max().item())
 
     def forward_speech(self, **kwargs):
         """Single pass: input audio + video + spk_emb -> conformer -> mel head.
@@ -114,11 +180,14 @@ class MMS_Speech_NoLLM_MelVC(MMS_Speech_NoLLM_E2E_SynthVC):
         if spk_emb is not None:
             spk_emb = spk_emb.unsqueeze(1)
 
-        # --- AV-HuBERT (frozen), once ---
-        with torch.no_grad():
-            avhubert_source = {"audio": None, "video": src["video"]}
-            avhubert_output = self.avhubert(source=avhubert_source, padding_mask=kwargs["padding_mask"])
-            avhubert_output["encoder_out"] = avhubert_output["encoder_out"].transpose(0, 1)
+        # --- AV-HuBERT, once. NO no_grad wrapper: grad is gated by requires_grad,
+        # so only the unfrozen top-N layers build graph / get gradient; the frozen
+        # lower layers produce non-grad tensors and are pruned from the graph
+        # automatically (no activation storage, no backward). Val/inference still
+        # run under fairseq's global no_grad. ponytail: split layers only if OOM.
+        avhubert_source = {"audio": None, "video": src["video"]}
+        avhubert_output = self.avhubert(source=avhubert_source, padding_mask=kwargs["padding_mask"])
+        avhubert_output["encoder_out"] = avhubert_output["encoder_out"].transpose(0, 1)
         video_lengths = torch.sum(~avhubert_output["padding_mask"], dim=1).tolist()
         max_vid_len = max(video_lengths)
 
@@ -143,9 +212,9 @@ class MMS_Speech_NoLLM_MelVC(MMS_Speech_NoLLM_E2E_SynthVC):
             target_lengths = torch.clamp((len_target_sr - hop) // hop + 1, min=1)
         max_target_len = int(target_lengths.max().item())
 
-        # --- Whisper (frozen) on the input audio ---
-        with torch.no_grad():
-            whisper_enc_out = self.whisper(src)
+        # --- Whisper on the input audio. NO no_grad: same rationale as AV-HuBERT
+        # above — only the unfrozen top-N whisper layers get graph/gradient.
+        whisper_enc_out = self.whisper(src)
 
         # --- shared pipeline: fusion -> transconv -> interp(tgt=mel frames)
         #     -> proj2 -> conformer(+spk_emb) ---
@@ -191,4 +260,5 @@ class MMS_Speech_NoLLM_MelVC(MMS_Speech_NoLLM_E2E_SynthVC):
             "melspec": melspec,
             "target_lengths": target_lengths,
             "residual_ratio": getattr(self, "_last_residual_ratio", None),
+            "dur_loss": getattr(self, "_dur_loss", None),   # duration predictor loss (or None)
         }

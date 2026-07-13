@@ -138,5 +138,49 @@ class Speech_Rate_Predictor(nn.Module):
         x = torch.cat([sr_token_expanded, x], dim=1) 
         x, _ = self.encoder(x)
         sr_prediction = self.activation(self.sr_predictor(x[:, 0, :]))
-        
+
         return sr_prediction
+
+
+class DurationPredictor(nn.Module):
+    """Predicts output/input mel-frame ratio from Q-Former content tokens + target spk.
+
+    N = L_in * ratio, ratio = r_min + (1-r_min)*sigmoid(x)  → guarantees
+    r_min*L_in <= N <= L_in (never slower than the input, never absurdly faster).
+    Mirrors Speech_Rate_Predictor: a learned [DUR] token, a small transformer,
+    read token 0. Inputs are detached by the caller; this trains only itself.
+    """
+    def __init__(self, content_dim=1024, spk_dim=512, d=256, num_layers=2, r_min=0.5):
+        super().__init__()
+        args = SimpleNamespace(**{
+            'dropout': 0.0, 'encoder_embed_dim': d, 'conv_pos': 128,
+            'conv_pos_groups': 16, 'encoder_ffn_embed_dim': 1024,
+            'encoder_attention_heads': 4, 'attention_dropout': 0.0,
+            'activation_dropout': 0.1, 'activation_fn': 'gelu',
+            'layer_norm_first': True, 'encoder_layers': num_layers,
+            'encoder_layerdrop': 0.1,
+        })
+        self.proj = nn.Linear(content_dim, d)
+        self.dur_token = nn.Parameter(torch.zeros(1, 1, d))
+        nn.init.xavier_uniform_(self.dur_token)
+        self.encoder = TransformerEncoder(args)
+        self.spk_proj = nn.Linear(spk_dim, d)
+        self.head = nn.Linear(d, 1)
+        self.r_min = float(r_min)
+
+    def forward(self, content, spk):
+        """content (B, Q, content_dim), spk (B, 1, spk_dim) or (B, spk_dim) → ratio (B,).
+
+        Runs in the module's own dtype (bf16 under common.bf16); do NOT force float
+        or the Linear weights (bf16) mismatch the input.
+        """
+        content = content.to(self.proj.weight.dtype)
+        x = self.proj(content)
+        tok = self.dur_token.expand(x.size(0), -1, -1).to(x.dtype)
+        x = torch.cat([tok, x], dim=1)
+        x, _ = self.encoder(x)
+        if spk.dim() == 3:
+            spk = spk.squeeze(1)
+        z = x[:, 0, :] + self.spk_proj(spk.to(self.spk_proj.weight.dtype))
+        ratio = self.r_min + (1.0 - self.r_min) * torch.sigmoid(self.head(z).squeeze(-1))
+        return ratio

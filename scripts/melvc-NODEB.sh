@@ -120,7 +120,8 @@ if [ "${RESUME}" = "true" ]; then
         | sed 's/^- //' \
         | grep -v '^distributed_training\.' \
         | grep -v '^hydra\.run\.dir' \
-        | grep -v '^checkpoint\.restore_file')
+        | grep -v '^checkpoint\.restore_file' \
+        | grep -v '^checkpoint\.finetune_from_model')
     LATEST_CKPT=$(ls -1 ${OUT_PATH}/checkpoints/checkpoint[0-9]*.pt 2>/dev/null | sort -V | tail -1)
     if [ -z "$LATEST_CKPT" ]; then
         echo "ERROR: RESUME requested but no numbered checkpoint in ${OUT_PATH}/checkpoints"; exit 1
@@ -155,6 +156,10 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} fairseq-hydra-train \
     +task.vocoder_trainable=false \
     +task.whisper_top_n_trainable=${WHISPER_TOP_N} \
     +task.whisper_layernorm_trainable=${WHISPER_LN_TRAINABLE} \
+    +task.avhubert_top_n_trainable=${AVHUBERT_TOP_N:-0} \
+    +task.avhubert_layernorm_trainable=${AVHUBERT_LN_TRAINABLE:-false} \
+    +task.ogm_enabled=${OGM_ENABLED:-false} \
+    +task.ogm_alpha=${OGM_ALPHA:-0.3} \
     +task.mel_head_trainable=${MEL_HEAD_TRAINABLE} \
     +task.number_of_synths=${NUMBER_OF_SYNTHS:-0} \
     +task.whisper_pretrained_path=${WHISPER_PRETRAINED_PATH} \
@@ -193,8 +198,24 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} fairseq-hydra-train \
     model.stage1_checkpoint="" \
     model.vocoder_checkpoint="" \
     criterion.mel_loss_weight=${MEL_LOSS_WEIGHT:-1.0} \
+    +criterion.ssim_weight=${SSIM_WEIGHT:-0.0} \
+    +criterion.mse_weight=${MSE_WEIGHT:-0.0} \
+    +criterion.gv_weight=${GV_WEIGHT:-0.0} \
+    +model.use_discriminator=${USE_DISCRIMINATOR:-false} \
+    +criterion.use_discriminator=${FORCE_DISC_ACTIVE:-false} \
+    +criterion.disc_pretrain=${DISC_PRETRAIN:-true} \
+    +criterion.disc_start_updates=${DISC_START_UPDATES:-0} \
+    +criterion.adv_warmup_updates=${ADV_WARMUP_UPDATES:-0} \
+    +criterion.adv_weight=${ADV_WEIGHT:-0.2} \
+    +criterion.fm_weight=${FM_WEIGHT:-2.0} \
+    +criterion.disc_lr=${DISC_LR:-2e-4} \
+    +criterion.disc_beta1=${DISC_BETA1:-0.8} \
+    +criterion.disc_beta2=${DISC_BETA2:-0.99} \
+    +criterion.disc_grad_clip=${DISC_GRAD_CLIP:-20.0} \
+    +criterion.freeze_disc=${FREEZE_DISC:-false} \
+    optimizer.weight_decay=${WEIGHT_DECAY:-0.01} \
     optimization.lr=[${LR:-3e-5}] \
-    optimization.max_update=${MAX_UPDATE:-300000} \
+    optimization.max_update=${MAX_UPDATE:-3000000} \
     optimization.max_epoch=${MAX_EPOCH:-20000} \
     optimization.update_freq=[${UPDATE_FREQ:-2}] \
     lr_scheduler.warmup_updates=${WARMUP_UPDATES:-2000} \

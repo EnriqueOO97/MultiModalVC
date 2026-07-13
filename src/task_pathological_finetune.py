@@ -78,6 +78,14 @@ class MMS_PathologicalFinetuneConfig(MMS_LLaMA_TrainingSynthVCConfig):
         default=False,
         metadata={"help": "Unfreeze the final layer_norm of the Whisper encoder (only meaningful when whisper_top_n_trainable > 0)"},
     )
+    avhubert_top_n_trainable: int = field(
+        default=0,
+        metadata={"help": "Unfreeze the last N transformer layers of the AV-HuBERT encoder (0 = fully frozen)"},
+    )
+    avhubert_layernorm_trainable: bool = field(
+        default=False,
+        metadata={"help": "Unfreeze the AV-HuBERT encoder's final layer_norm (only meaningful when avhubert_top_n_trainable > 0)"},
+    )
     number_of_synths: int = field(
         default=6,
         metadata={"help": "How many synth targets (1..N) to pair with each input, in addition to the always-included real healthy target. 0 = healthy only. Applies to train and valid."},
@@ -89,6 +97,14 @@ class MMS_PathologicalFinetuneConfig(MMS_LLaMA_TrainingSynthVCConfig):
     disc_init_checkpoint: str = field(
         default="",
         metadata={"help": "Optional fairseq checkpoint to warm-start ONLY the discriminator(s) (mpd./msstftd./cqtd.* keys). The generator side is ignored. Used to rescue a clean (bug-independent) discriminator when the rest of the model is cold-started. Empty = disc from scratch."},
+    )
+    ogm_enabled: bool = field(
+        default=False,
+        metadata={"help": "On-the-fly gradient modulation (Peng et al. 2022): after backward, throttle whichever modality branch (audio=whisper/afeat, video=avhubert/vfeat) has the larger gradient, pushing the two toward balance so video isn't ignored. Skips modality-dropout steps automatically (one branch has ~0 grad). With ogm_alpha=0 it only measures+logs (no modulation)."},
+    )
+    ogm_alpha: float = field(
+        default=0.3,
+        metadata={"help": "OGM strength. Throttle coefficient k = 1 - tanh(alpha * rho), rho = max(ga/gv, gv/ga). Higher = harder throttle on the dominant branch; 0 = measure-only. Pick from a measured rho via alpha = atanh(1-k_target)/rho; ~0.05-0.1 is a gentle start."},
     )
 
 
@@ -114,6 +130,85 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
     @property
     def dictionaries(self) -> Optional[List[Dictionary]]:
         return None
+
+    # ---- OGM: on-the-fly gradient modulation (Peng et al., CVPR 2022) ----------
+    # Audio branch = whisper(+afeat) ; video branch = avhubert(+vfeat). Only the
+    # TRAINABLE params of each have a grad (frozen layers -> grad None -> ignored).
+    _OGM_AUDIO = ("whisper.", "afeat_1d_conv.")
+    _OGM_VIDEO = ("avhubert.", "vfeat_1d_conv.")
+
+    def train_step(self, sample, model, criterion, optimizer, update_num, ignore_grad=False):
+        # super() runs forward + backward; grads are populated on return.
+        out = super().train_step(sample, model, criterion, optimizer, update_num, ignore_grad)
+        # Call OGM on EVERY rank every step (drop the `not ignore_grad` guard): its
+        # internal all-reduce must be rank-symmetric, and ignore_grad is set per-rank
+        # on dummy-batch steps. Skipping it on dummy steps desynced the collective
+        # count across ranks -> NCCL all-reduce timeout / crash. On dummy steps grads
+        # are ~0, so the eps guard inside skips the actual modulation anyway.
+        if getattr(self.cfg, "ogm_enabled", False):
+            self._ogm_modulate(model, update_num)
+        return out
+
+    @staticmethod
+    def _ogm_base_name(n):
+        # The training model is wrapped (DDP + an inner wrapper), so named_parameters()
+        # are prefixed with "module.module." — strip ALL leading "module." levels so the
+        # branch prefixes ("avhubert.", "whisper.", ...) match.
+        while n.startswith("module."):
+            n = n[7:]
+        return n
+
+    def _ogm_modulate(self, model, update_num) -> None:
+        import torch
+        import torch.distributed as dist
+
+        dev = next(model.parameters()).device
+
+        def branch_sqnorm(prefixes):
+            # Device scalar, 0.0 if this branch has no local grad this step -- NEVER
+            # None. The all-reduce below MUST be reached identically on every rank;
+            # if a rank whose modality-dropout masked a branch returned early while
+            # another rank called the collective, NCCL would deadlock (this is the
+            # bug that hung the run once avhubert started receiving gradients).
+            s = torch.zeros((), device=dev)
+            for n, p in model.named_parameters():
+                if p.grad is not None and self._ogm_base_name(n).startswith(prefixes):
+                    s = s + p.grad.detach().pow(2).sum()
+            return s
+
+        ga2 = branch_sqnorm(self._OGM_AUDIO)
+        gv2 = branch_sqnorm(self._OGM_VIDEO)
+        # UNCONDITIONAL, rank-symmetric collective: every rank reaches this exactly
+        # once per step regardless of its own modality dropout. Summed norms make
+        # rho/k global and identical everywhere; scaling local grads by that global
+        # scalar commutes with the later DDP all-reduce, so workers stay consistent.
+        if dist.is_available() and dist.is_initialized():
+            packed = torch.stack([ga2, gv2])
+            dist.all_reduce(packed)
+            ga2, gv2 = packed[0], packed[1]
+        ga = ga2.sqrt()
+        gv = gv2.sqrt()
+        eps = 1e-8
+        # ga/gv are GLOBAL now -> this branch is identical on all ranks, so every
+        # rank skips or continues together (no collective past this point).
+        if ga < eps or gv < eps:
+            return
+        alpha = float(self.cfg.ogm_alpha)
+        if ga >= gv:
+            rho, prefixes, dom = ga / gv, self._OGM_AUDIO, "audio"
+        else:
+            rho, prefixes, dom = gv / ga, self._OGM_VIDEO, "video"
+        k = float(1.0 - torch.tanh(alpha * rho))
+        if alpha > 0.0 and k < 1.0:           # alpha==0 => measure-only (k==1, no-op)
+            for n, p in model.named_parameters():
+                if p.grad is not None and self._ogm_base_name(n).startswith(prefixes):
+                    p.grad.mul_(k)
+        rank0 = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+        if rank0 and update_num % 50 == 0:
+            logger.info(
+                f"[OGM] upd={update_num} ga={float(ga):.4f} gv={float(gv):.4f} "
+                f"rho={float(rho):.3f} dominant={dom} k={k:.4f}"
+            )
 
     @classmethod
     def setup_task(cls, cfg: MMS_PathologicalFinetuneConfig, **kwargs):
@@ -189,14 +284,20 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
         # missing conformer/Qformer/proj and could not be used for inference alone.
         # named_parameters() excludes buffers, so BatchNorm running stats (incl. the
         # drifted avhubert stats the model adapted to) are still saved.
-        _SAVE_EXCLUDE = ("avhubert.", "sr_predictor.")
+        # Exclude FROZEN avhubert params (rebuilt from w2v_path at load) and the
+        # always-frozen sr_predictor. TRAINABLE avhubert params (the unfrozen top-N
+        # layers + final layer_norm) are NOT excluded — they must persist, exactly
+        # like the trainable top-N whisper layers do, or the adaptation is lost on
+        # reload (build_model rebuilds avhubert from w2v_path, overwriting them).
         model.freeze_params = [
-            n for n, _ in model.named_parameters() if n.startswith(_SAVE_EXCLUDE)
+            n for n, p in model.named_parameters()
+            if (n.startswith("avhubert.") and not p.requires_grad)
+            or n.startswith("sr_predictor.")
         ]
         logger.info(
             f"[finetune-freeze] save-excludes {len(model.freeze_params)} param keys "
-            f"(avhubert + sr_predictor, both rebuilt at load); everything else "
-            f"persisted -> self-contained checkpoint"
+            f"(FROZEN avhubert + sr_predictor, rebuilt at load); trainable avhubert "
+            f"layers + everything else persisted -> self-contained checkpoint"
         )
         return model
 
@@ -335,7 +436,7 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
             "avhubert.",
             "whisper.",          # re-opened selectively below if whisper_top_n > 0
             "sr_predictor.",
-            "mpd.", "msstftd.", "cqtd.",  # disc params managed by criterion
+            "mpd.", "msstftd.", "cqtd.", "mel_disc.",  # disc params managed by criterion
         )
 
         def match_group(name: str) -> Optional[str]:
@@ -398,6 +499,42 @@ class MMS_PathologicalFinetuneTask(FairseqTask):
                 for p in whisper_ln.parameters():
                     p.requires_grad = True
                 logger.info("[finetune-freeze] whisper final layer_norm trainable")
+
+        # AV-HuBERT top-N: unfreeze the last N transformer layers of the encoder
+        # (fairseq wav2vec2 TransformerEncoder.layers). Mirrors the whisper block;
+        # the video frontend (ResNet) stays frozen. Param prefix:
+        # avhubert.w2v_model.encoder.layers.{i}.*
+        if self.cfg.avhubert_top_n_trainable > 0:
+            av_layers = getattr(getattr(model, "avhubert", None), "w2v_model", None)
+            av_layers = getattr(getattr(av_layers, "encoder", None), "layers", None)
+            if av_layers is None:
+                logger.warning(
+                    "[finetune-freeze] avhubert_top_n_trainable=%d requested but "
+                    "model.avhubert.w2v_model.encoder.layers not found — skipping",
+                    self.cfg.avhubert_top_n_trainable,
+                )
+            else:
+                total = len(av_layers)
+                n = min(self.cfg.avhubert_top_n_trainable, total)
+                opened = 0
+                for layer in av_layers[-n:]:
+                    for p in layer.parameters():
+                        p.requires_grad = True
+                        opened += p.numel()
+                logger.info(
+                    "[finetune-freeze] avhubert top %d/%d encoder layers trainable (%s params)",
+                    n, total, f"{opened:,}",
+                )
+
+        if self.cfg.avhubert_layernorm_trainable:
+            av_ln = getattr(getattr(model, "avhubert", None), "w2v_model", None)
+            av_ln = getattr(getattr(av_ln, "encoder", None), "layer_norm", None)
+            if av_ln is None:
+                logger.warning("[finetune-freeze] avhubert_layernorm_trainable=True but model.avhubert.w2v_model.encoder.layer_norm not found — skipping")
+            else:
+                for p in av_ln.parameters():
+                    p.requires_grad = True
+                logger.info("[finetune-freeze] avhubert encoder final layer_norm trainable")
 
         # Put fully-frozen groups into eval() mode so dropout/BN-like state is inert.
         eval_targets = {

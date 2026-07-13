@@ -49,17 +49,21 @@ class EncoderLayerWithCrossAttn(EncoderLayer):
         normalize_before=True,
         concat_after=False,
         macaron_style=False,
+        content_attn=None,
     ):
         # Parent sets up: self_attn, feed_forward, conv_module, norms, macaron
         super().__init__(
             size, self_attn, feed_forward, conv_module,
             dropout_rate, normalize_before, concat_after, macaron_style,
         )
-        # Cross-attention sub-layer (new)
+        # Cross-attention sub-layer (speaker)
         self.cross_attn = cross_attn
         self.norm_cross = LayerNorm(size)
+        # Interleaved main-attn swap: when content_attn is set, THIS block uses
+        # content cross-attn (Q=x, K/V=content memory) INSTEAD of self-attn.
+        self.content_attn = content_attn
 
-    def forward(self, x_input, mask, cache=None, spk_emb=None):
+    def forward(self, x_input, mask, cache=None, spk_emb=None, content_mem=None):
         """Forward with optional cross-attention to speaker embedding.
 
         Args:
@@ -98,7 +102,13 @@ class EncoderLayerWithCrossAttn(EncoderLayer):
             residual = residual[:, -1:, :]
             mask = None if mask is None else mask[:, -1:, :]
 
-        if pos_emb is not None:
+        if self.content_attn is not None and content_mem is not None:
+            # Content cross-attn REPLACES self-attn in this block. Q=x_q (N frames),
+            # K/V=content_mem (Q-Former tokens). ponytail: mask=None — padded content
+            # tokens are attended; add a rectangular-mask path if it hurts alignment
+            # (the existing MHA mask builder assumes a square self-attn mask).
+            x_att = self.content_attn(x_q, content_mem, content_mem, None)
+        elif pos_emb is not None:
             x_att = self.self_attn(x_q, x, x, pos_emb, mask)
         else:
             x_att = self.self_attn(x_q, x, x, mask)

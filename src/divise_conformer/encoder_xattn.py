@@ -30,9 +30,9 @@ from .subsampling import Conv2dSubsampling
 class MultiSequentialWithCrossAttn(torch.nn.Sequential):
     """Sequential that forwards (x, mask) positional args AND spk_emb kwarg."""
 
-    def forward(self, *args, spk_emb=None):
+    def forward(self, *args, spk_emb=None, content_mem=None):
         for m in self:
-            args = m(*args, spk_emb=spk_emb)
+            args = m(*args, spk_emb=spk_emb, content_mem=content_mem)
         return args
 
 
@@ -67,6 +67,8 @@ class EncoderWithCrossAttn(torch.nn.Module):
         zero_triu=False,
         cnn_module_kernel=31,
         padding_idx=-1,
+        use_content_xattn=False,
+        content_interleave_start="odd",
     ):
         super().__init__()
 
@@ -130,41 +132,47 @@ class EncoderWithCrossAttn(torch.nn.Module):
         convolution_layer = ConvolutionModule
         convolution_layer_args = (attention_dim, cnn_module_kernel)
 
-        # Build the layer stack
-        self.encoders = MultiSequentialWithCrossAttn(
-            *[
-                EncoderLayerWithCrossAttn(
-                    attention_dim,
-                    encoder_attn_layer(*encoder_attn_layer_args),
-                    cross_attn_layer(*cross_attn_layer_args),
-                    positionwise_layer(*positionwise_layer_args),
-                    convolution_layer(*convolution_layer_args) if use_cnn_module else None,
-                    dropout_rate,
-                    normalize_before,
-                    concat_after,
-                    macaron_style,
-                )
-                for _ in range(num_blocks)
-            ]
-        )
+        # Build the layer stack. Interleaved main-attn swap: when use_content_xattn,
+        # every other block gets a content cross-attn that REPLACES its self-attn.
+        # start="odd" → 1-based blocks 1,3,5,... (0-based even index) get content-attn.
+        start_even = (content_interleave_start == "odd")
+        layers = []
+        for i in range(num_blocks):
+            is_content = use_content_xattn and ((i % 2 == 0) == start_even)
+            content_attn = (MultiHeadedAttention(*cross_attn_layer_args)
+                            if is_content else None)
+            layers.append(EncoderLayerWithCrossAttn(
+                attention_dim,
+                encoder_attn_layer(*encoder_attn_layer_args),
+                cross_attn_layer(*cross_attn_layer_args),
+                positionwise_layer(*positionwise_layer_args),
+                convolution_layer(*convolution_layer_args) if use_cnn_module else None,
+                dropout_rate,
+                normalize_before,
+                concat_after,
+                macaron_style,
+                content_attn=content_attn,
+            ))
+        self.encoders = MultiSequentialWithCrossAttn(*layers)
 
         if self.normalize_before:
             self.after_norm = LayerNorm(attention_dim)
 
-    def forward(self, xs, masks=None, spk_emb=None):
-        """Encode input sequence with optional speaker cross-attention.
+    def forward(self, xs, masks=None, spk_emb=None, content_mem=None):
+        """Encode input sequence with optional speaker + content cross-attention.
 
         Args:
             xs (torch.Tensor): Input features (B, T, D)
             masks (torch.Tensor): Mask (B, T) or None
             spk_emb (torch.Tensor): Speaker embedding (B, 1, D) or None
+            content_mem (torch.Tensor): Q-Former content tokens (B, Q, D) or None
 
         Returns:
             torch.Tensor: Encoded output (B, T, D)
             torch.Tensor: Output mask
         """
         xs = self.embed(xs)
-        xs, masks = self.encoders(xs, masks, spk_emb=spk_emb)
+        xs, masks = self.encoders(xs, masks, spk_emb=spk_emb, content_mem=content_mem)
 
         if isinstance(xs, tuple):
             xs = xs[0]
@@ -190,17 +198,20 @@ class ConformerEncoderWithCrossAttn(torch.nn.Module):
         }
         return lookup_table[size]
 
-    def __init__(self, size) -> None:
+    def __init__(self, size, use_content_xattn=False, content_interleave_start="odd") -> None:
         super().__init__()
         kwargs = self.lookup(size)
-        print(f"conformer encoder with cross-attention, details={kwargs}")
+        print(f"conformer encoder with cross-attention, details={kwargs} "
+              f"content_xattn={use_content_xattn} start={content_interleave_start}")
         self.encoder = EncoderWithCrossAttn(
             macaron_style=True,
             use_cnn_module=True,
             input_layer=None,
+            use_content_xattn=use_content_xattn,
+            content_interleave_start=content_interleave_start,
             **kwargs,
         )
 
-    def forward(self, xs, masks=None, spk_emb=None):
-        x, mask = self.encoder(xs, masks, spk_emb=spk_emb)
+    def forward(self, xs, masks=None, spk_emb=None, content_mem=None):
+        x, mask = self.encoder(xs, masks, spk_emb=spk_emb, content_mem=content_mem)
         return x

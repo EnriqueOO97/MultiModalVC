@@ -195,6 +195,11 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         # Keeping it here as documentation of the shared logic.
         raise NotImplementedError("Use forward_speech directly")
 
+    def _maybe_predict_duration(self, content_tokens, query_lengths, spk_emb,
+                                video_lengths, target_lengths, max_target_len):
+        """No-op hook. MelVC overrides to predict N from content tokens + spk."""
+        return target_lengths, max_target_len
+
     def _run_pipeline_to_conformer(self, whisper_enc_out, avhubert_output, video_lengths,
                                     max_vid_len, target_lengths, max_target_len, spk_emb,
                                     mode='av'):
@@ -269,6 +274,16 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
             queries = self.avfeat_to_llm(av_feat)
             query_lengths = len_feat
 
+        # 4b. Optional duration predictor (MelVC): may override the interpolation
+        # target N at inference; trains itself via a stashed loss at training.
+        # No-op default on this base class (returns args unchanged).
+        target_lengths, max_target_len = self._maybe_predict_duration(
+            queries, query_lengths, spk_emb, video_lengths, target_lengths, max_target_len)
+
+        # 4c. Optional content memory for conformer content cross-attn (MelVC).
+        content_mem = (self.content_proj(queries)
+                       if getattr(self, "content_proj", None) is not None else None)
+
         # 5. Pad and project
         B = queries.size(0)
         av_lengths = query_lengths
@@ -328,7 +343,7 @@ class MMS_Speech_NoLLM_E2E_SynthVC(MMS_Speech_NoLLM_E2E):
         # 7. Projection 2 + Conformer with cross-attention
         x = self.proj2(x)
         x = self.ln2(x)
-        x = self.conformer(x, spk_emb=spk_emb)  # cross-attn to speaker embedding
+        x = self.conformer(x, spk_emb=spk_emb, content_mem=content_mem)  # spk + optional content cross-attn
         x = self.ln3(x)  # (B, T, 512)
 
         return x

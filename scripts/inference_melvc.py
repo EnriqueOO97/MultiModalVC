@@ -64,6 +64,8 @@ import src.modelSpeechNoLLM_MelVC
 import src.criterionMelVC
 
 from src.utils import Compose, Normalize, CenterCrop, load_video
+# Used only by --gt-recon: same mel + resample that built the TRAINING target.
+from src.bigvgan_mel import mel_from_config as _bvmel, resample as _bvresample
 
 if _added_dummy and "dummy" in sys.argv:
     sys.argv.remove("dummy")
@@ -140,6 +142,11 @@ def get_parser():
                         "(each chunk -> its own _partN WAV). Omit to process whole.")
     p.add_argument("--device", type=str, default=None,
                    help="Device (default: cuda if available, else cpu)")
+    p.add_argument("--dump-mels", action="store_true",
+                   help="Also save each predicted mel as <out>_mel.npy (shape 80xT) for inspection")
+    p.add_argument("--gt-recon", action="store_true",
+                   help="Also write {sample_id}_gtrecon.wav = BigVGAN reconstruction of the GT "
+                        "healthy wav (BigVGAN's upper bound; A/B against the model output)")
     return p
 
 
@@ -223,6 +230,26 @@ def load_model(checkpoint_path, manifest_dir, device):
         if not torch.allclose(_ck_w0.float(), _live_w0.float(), atol=1e-5):
             raise RuntimeError("Whisper layer-0 weights in loaded model do NOT match the checkpoint.")
         logger.info("[whisper-verify] live whisper.layers[0].q_proj matches checkpoint — OK")
+
+    # --- Verify EVERY trained AV-HuBERT top layer came FROM the checkpoint (not left
+    # at the stock w2v_path weights). Detects whichever encoder layers the checkpoint
+    # saved (frozen ones are excluded at save time) and checks each. Frozen-avhubert
+    # checkpoints have none -> skipped. Mirrors the whisper spot-check above. ---
+    import re as _re
+    _av_layers = sorted({int(_m.group(1)) for _k in _ckpt_sd
+                         if (_m := _re.search(r"avhubert\.w2v_model\.encoder\.layers\.(\d+)\.", _k))})
+    if _av_layers:
+        logger.info(f"[avhubert-verify] checkpoint saved trained avhubert encoder layers {_av_layers}")
+        for _L in _av_layers:
+            _ck_av = _ckpt_sd.get(f"avhubert.w2v_model.encoder.layers.{_L}.fc1.weight")
+            if _ck_av is None:
+                continue
+            _live_av = model.avhubert.w2v_model.encoder.layers[_L].fc1.weight.detach().cpu()
+            if not torch.allclose(_ck_av.float(), _live_av.float(), atol=1e-5):
+                raise RuntimeError(f"AV-HuBERT layer-{_L} weights in loaded model do NOT match the checkpoint.")
+            logger.info(f"[avhubert-verify] live avhubert.layers[{_L}].fc1 matches checkpoint — OK")
+    else:
+        logger.info("[avhubert-verify] no trained avhubert encoder layers in checkpoint (frozen backbone) — skipped")
     del _raw_for_check, _ckpt_sd
 
     # MelVC already deletes the vocoder in __init__ and has no discriminators.
@@ -367,6 +394,25 @@ def run_inference(args):
             logger.warning(f"Skipping {sample_id}: xvector load failed — {e}")
             continue
 
+        # --- optional: BigVGAN upper bound = reconstruct the GT healthy wav ---
+        # GT healthy wav (16k) -> resample 22.05k -> BigVGAN-format mel -> BigVGAN.
+        # If this sounds clean and the model output doesn't, the predicted mels are
+        # the cause (oversmoothing), not BigVGAN or the mel format.
+        if args.gt_recon:
+            try:
+                sr_h, hwav = wavfile.read(healthy_path)
+                hwav = (hwav / 32768.0 if hwav.dtype == np.int16 else hwav).astype(np.float32)
+                hwav = torch.from_numpy(hwav).unsqueeze(0)               # (1, N) @ sr_h
+                hwav22 = _bvresample(hwav, sr_h, 22050)                  # BigVGAN SR
+                gt_mel = _bvmel(hwav22).to(device).float()              # (1, 80, T)
+                with torch.no_grad():
+                    gt_wav = vocoder(gt_mel)
+                gw = np.clip(gt_wav.squeeze(0).squeeze(0).cpu().float().numpy(), -1.0, 1.0)
+                wavfile.write(os.path.join(args.output_dir, f"{sample_id}_gtrecon.wav"),
+                              args.sample_rate, (gw * 32767.0).astype(np.int16))
+            except Exception as e:
+                logger.warning(f"{sample_id}: gt-recon failed — {e}")
+
         # Chunk plan (AV-HuBERT video @ 25 fps, audio @ 16 kHz).
         if args.chunk_seconds is not None and len(wav_data) > int(args.chunk_seconds * 16000):
             chunk_audio = int(args.chunk_seconds * 16000)
@@ -418,6 +464,9 @@ def run_inference(args):
             wavfile.write(out_path, args.sample_rate, wav_int16)
             total_saved += 1
             logger.debug(f"Saved {out_name} | samples={len(wav_int16)}")
+
+            if args.dump_mels:                                     # (80, T) predicted mel
+                np.save(out_path[:-4] + "_mel.npy", mel.squeeze(0).cpu().numpy())
 
     logger.info(f"Done. Saved {total_saved} WAV files to {args.output_dir}")
 
