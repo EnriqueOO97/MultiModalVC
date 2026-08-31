@@ -38,7 +38,8 @@ task:
   fine_tuning: true
   stack_order_audio: 4
   tokenizer_bpe_name: sentencepiece
-  max_sample_size: 500
+  max_sample_size: 525  # 21s @ 25fps. >20s samples are deleted from the manifests, so this
+  # 1s margin guarantees no remaining clip ever hits the temporal-crop path in _collater_video.
   min_sample_size: 10
   modalities: ["video", "audio"]
   image_aug: true

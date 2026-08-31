@@ -58,10 +58,21 @@ logger = logging.getLogger(__name__)
 
 
 def _xvector_path(wav_path: str) -> str:
-    """Convert ``<stem>.wav`` -> ``<stem>_xvector.pt`` (naming convention)."""
-    if wav_path.endswith(".wav"):
-        return wav_path[:-4] + "_xvector.pt"
-    raise ValueError(f"Expected .wav path, got: {wav_path}")
+    """Convert ``<stem>.wav`` -> ``<stem>_xvector.pt`` (naming convention).
+
+    One exception: ``healthyTrim.wav`` is a re-trimmed variant of ``healthy.wav``
+    (same speaker, same words, natural pace instead of time-stretched) added later,
+    so it ships no xvector of its own. An xvector is a *speaker* embedding, so the
+    healthy speaker's existing one applies verbatim -- and it is the exact tensor the
+    checkpoint was trained with. Map ``*Trim.wav`` -> the un-trimmed stem's xvector.
+    Every other path is untouched: no globbing, no guessing.
+    """
+    if not wav_path.endswith(".wav"):
+        raise ValueError(f"Expected .wav path, got: {wav_path}")
+    stem = wav_path[:-4]
+    if stem.endswith("Trim"):
+        stem = stem[:-len("Trim")]          # healthyTrim -> healthy
+    return stem + "_xvector.pt"
 
 
 def _count_video_frames(path: str) -> int:
@@ -451,7 +462,11 @@ class mms_pathological_finetune_dataset(FairseqDataset):
                 out[i] = torch.cat([a, a.new_full([-diff] + feat_shape, 0.0)])
                 padding_mask[i, diff:] = True
             else:
-                start = np.random.randint(0, diff + 1)
+                # Deterministic: always take the FIRST `audio_size` frames (start=0), so
+                # the video window and the audio (always read from t=0) share the same
+                # start and end -> audio/video stay time-synced for clips longer than the
+                # cap. (Previously np.random.randint desynced them for >cap clips.)
+                start = 0
                 out[i] = a[start : start + audio_size]
                 audio_starts[i] = start
         if out.dim() == 5:

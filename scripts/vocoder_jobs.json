@@ -1,0 +1,9 @@
+[
+  {
+    "generator": "/data/fs201163/eo49197/MultiModalVC/exp/bigvganGTA/p2h_from_de_stage2_OGM_ck500/g_best_mel",
+    "tag": "p2h_ck500_gbestmel",
+    "npy_folders": [
+      "/data/fs201163/eo49197/DumpedMels/classic_ogm_ckpt500/classic_ogm_ckpt500__tf__av"
+    ]
+  }
+]

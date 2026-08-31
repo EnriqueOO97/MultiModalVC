@@ -1,0 +1,8 @@
+[
+  {
+    "checkpoint": "/data/fs201163/eo49197/MultiModalVC/exp/multiModalVC-synth/melvc_p2h_from_de_stage2_OGM/checkpoints/checkpoint500.pt",
+    "modes": ["tf"],
+    "modalities": ["av"],
+    "tag": "classic_ogm_ckpt500"
+  }
+]
