@@ -47,21 +47,41 @@ TRANSCRIPTS = "/data/fs201163/eo49197/VoiceConversion-fwf/transcripts.csv"
 OUT_ROOT = os.environ.get("OUT_ROOT", "/data/fs201163/eo49197/DumpedMels_run5_tf_av")
 MODALITY = os.environ.get("MODALITY", "av")   # 'av' | 'audio_only' | 'video_only'
 
+# Optional noisy-input eval (Stage 1 only): inject babble noise on the INPUT audio (target
+# stays clean). Env-overridable, same pattern as OUT_ROOT/MODALITY. Empty NOISE_WAV = clean.
+#   NOISE_WAV=/.../babble_noise.wav NOISE_PROB=1.0 SNR=0 OUT_ROOT=... MODALITY=... sbatch ...
+NOISE_WAV = os.environ.get("NOISE_WAV", "")   # "" -> clean input (default)
+NOISE_PROB = float(os.environ.get("NOISE_PROB", "0.0"))
+SNR = os.environ.get("SNR", "")               # e.g. "0" or "-10,-5,0"; blank if clean
+NOISE_SEED = os.environ.get("NOISE_SEED", "1234")   # reproducible eval noise
+MODE = os.environ.get("MODE", "dp")   # 'dp' = duration prediction | 'tf' = teacher forcing
+
 # ASR (Stage 5) model. large-v3 gave the best (lowest) ceiling, so it's the standard here.
 # The per-folder ASR report is model-tagged (asr_<model>.txt) so switching ASR models
 # never clobbers or reuses another model's results -- everything recomputes cleanly per model.
-ASR_MODEL = "openai/whisper-large-v3"
+ASR_MODEL = os.environ.get("ASR_MODEL", "openai/whisper-large-v3")
 
 # (checkpoint, mode): mode 'tf' = teacher forcing, 'dp' = duration prediction.
-# This run: 7 generators -- 3 late continuation checkpoints (250/300/best) + the 2 gamma
-# runs (700/best, 800/best). All marked 'dp'; if a checkpoint has no duration predictor,
-# dump_mels_eval auto-falls back to 'tf' for it.
+# Modality x mode ablation on the test split (MODALITY and MODE are both env-overridable).
 _EXP = "/data/fs201163/eo49197/MultiModalVC/exp/multiModalVC-synth"
 _CONT = f"{_EXP}/melvc_p2h_warp_softdtw_adv2_sweep_cont/checkpoints"
 _G01 = f"{_EXP}/melvc_gamma01/checkpoints"
 _G5 = f"{_EXP}/melvc_gamma5/checkpoints"
+_G5B = f"{_EXP}/melvc_gamma5_balanced/checkpoints"
+# Continuation of the balanced run (init from balanced ck800) on the manifest that now
+# carries 856 QuickVC-converted -> original LRS3 rows (9,978 rows total).
+# Alpha sweep on the cont50 x ck73 pair. alpha = share of the FINETUNED (cont50) model.
+# Measured drift: cont50 sits 0.091 from ck73 but only 0.027 from balanced-700, so at
+# alpha=0.8 the pull toward ck73 (~0.018) swamps the continuation's gain -- which is why
+# a0.8 landed on checkpoint C's numbers. Higher alpha keeps more of cont50.
+# a0.8 is already scored (DumpedMels_cont50ck73_*); these are the new points.
+# Noise robustness sweep for balanced-700 x ck73 at alpha=0.9. SNR is env-overridable
+# (NOISE_WAV / NOISE_PROB / SNR), so the whole sweep runs off THIS spec -- one launch per
+# (SNR, modality) cell, no edit between jobs. Babble noise is injected on the INPUT audio
+# only; the target stays clean.
+_BC = "/data/fs201163/eo49197/wiseft_bal700_ck73/checkpoints"
 CHECKPOINTS = [
-    (f"{_G5}/checkpoint800.pt",    "tf"),   # gamma5-800 (best generator), teacher forcing: N = input length
+    (f"{_BC}/checkpoint_a0.9.pt", MODE),
 ]
 
 # 6 BigVGAN generators. Same-folder files share a parent dir, so the wav-folder tag
@@ -160,6 +180,8 @@ def preflight(stages):
                 errs.append(f"vocoder config.json missing: {cfg}")
     if 5 in stages and not os.path.isfile(TRANSCRIPTS):
         errs.append(f"transcripts missing: {TRANSCRIPTS}")
+    if 1 in stages and NOISE_WAV and NOISE_PROB > 0.0 and not os.path.isfile(NOISE_WAV):
+        errs.append(f"noise wav missing: {NOISE_WAV}")
     # Stages 3/4/5-pred consume the Stage-2 wav folders; if Stage 2 isn't in THIS run
     # they must already exist on disk.
     if (stages & {3, 4, 5}) and 2 not in stages:
@@ -195,7 +217,10 @@ def main():
     stages = ({1, 2, 3, 4, 5} if args.stage.strip() == "all"
               else {int(x) for x in args.stage.split(",")})
 
-    banner(f"EVAL PIPELINE START  stages={sorted(stages)}  out_root={OUT_ROOT}")
+    noise_desc = (f"noise=ON wav={os.path.basename(NOISE_WAV)} prob={NOISE_PROB} snr={SNR or '?'}"
+                  if (NOISE_WAV and NOISE_PROB > 0.0) else "noise=OFF (clean input)")
+    banner(f"EVAL PIPELINE START  stages={sorted(stages)}  out_root={OUT_ROOT}  "
+           f"modality={MODALITY}  {noise_desc}")
     preflight(stages)
 
     # Every Stage-2 wav folder: <npy_folder>__<vocoder_tag>. Stages 3/4/5 score all of them.
@@ -219,9 +244,15 @@ def main():
     def _s1():
         c1 = os.path.join(_cfg_dir(), f"stage1_{ts}.json")
         build_stage1_config(c1)
+        noise_args = []
+        if NOISE_WAV and NOISE_PROB > 0.0:
+            noise_args = ["--noise-wav", NOISE_WAV, "--noise-prob", str(NOISE_PROB),
+                          "--noise-seed", NOISE_SEED]
+            if SNR:
+                noise_args += ["--snr", SNR]
         run([sys.executable, os.path.join(SCRIPTS, "dump_mels_eval.py"),
              "--config", c1, "--manifest", MANIFEST, "--out-root", OUT_ROOT,
-             "--num-workers", str(args.num_workers)] + ow)
+             "--num-workers", str(args.num_workers)] + noise_args + ow)
 
     def _s2():
         c2 = os.path.join(_cfg_dir(), f"stage2_{ts}.json")
@@ -231,6 +262,14 @@ def main():
 
     def _s3():
         run([sys.executable, os.path.join(SCRIPTS, "score_mos.py"), *wav_dirs] + ow)
+        # Reference-free quality needs no transcripts and no target, so the floor (the
+        # pathological INPUT) and the healthy target can be scored too -> mos_<role>.txt
+        # in OUT_ROOT/mos_baseline/, same role pattern as the ASR baselines in _s5.
+        mos = os.path.join(SCRIPTS, "score_mos.py")
+        base_dir = os.path.join(OUT_ROOT, "mos_baseline")
+        for role in ("source", "healthy"):                  # floor, ceiling
+            run([sys.executable, mos, "--role", role, "--manifest", MANIFEST,
+                 "--out-dir", base_dir] + ow)
 
     def _s4():
         run([sys.executable, os.path.join(SCRIPTS, "score_secs.py"), *wav_dirs,

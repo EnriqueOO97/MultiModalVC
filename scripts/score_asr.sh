@@ -37,6 +37,8 @@ MANIFEST=${MANIFEST:-/data/fs201163/eo49197/VoiceConversion-fwf/dub-autoalign-he
 TRANSCRIPTS=${TRANSCRIPTS:-/data/fs201163/eo49197/VoiceConversion-fwf/transcripts.csv}
 BATCH_SIZE=${BATCH_SIZE:-16}
 OW_FLAG=""; [ "${OVERWRITE:-}" = "true" ] && OW_FLAG="--overwrite"
+DH_FLAG=""; [ "${DUMP_HYPS:-}" = "true" ] && DH_FLAG="--dump-hyps"   # also write <out>_hyps.tsv
+LANGUAGE=${LANGUAGE:-de}
 
 echo "[asr] role=$ROLE  model=$MODEL  manifest=$MANIFEST  transcripts=$TRANSCRIPTS"
 
@@ -44,12 +46,12 @@ if [ "$ROLE" = "pred" ]; then
     : "${WAV_DIRS:?set WAV_DIRS=\"/dir1 /dir2 ...\" for role=pred}"
     python scripts/score_asr.py $WAV_DIRS \
         --role pred --model "$MODEL" --manifest "$MANIFEST" --transcripts "$TRANSCRIPTS" \
-        --batch-size "$BATCH_SIZE" $OW_FLAG
+        --batch-size "$BATCH_SIZE" --language "$LANGUAGE" $OW_FLAG $DH_FLAG
 else
     : "${OUT_DIR:?set OUT_DIR=/dir for role=$ROLE (where asr_$ROLE.txt is written)}"
     python scripts/score_asr.py \
         --role "$ROLE" --model "$MODEL" --out-dir "$OUT_DIR" --manifest "$MANIFEST" \
-        --transcripts "$TRANSCRIPTS" --batch-size "$BATCH_SIZE" $OW_FLAG
+        --transcripts "$TRANSCRIPTS" --batch-size "$BATCH_SIZE" --language "$LANGUAGE" $OW_FLAG $DH_FLAG
 fi
 
 echo "ALL DONE"

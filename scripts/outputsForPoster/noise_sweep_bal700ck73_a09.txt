@@ -1,0 +1,65 @@
+==============================================================================================
+balanced-700 x ck73   (WiSE-FT weight interpolation, alpha = 0.9)
+In-domain test split, 1608 utterances
+==============================================================================================
+
+Vocoder : BigVGAN  p2h_from_de_stage2_OGM_ck500 / g_best_mrstft
+ASR     : openai/whisper-large-v3 (multilingual), forced language = de
+SIM     : ECAPA-TDNN (speechbrain/spkrec-ecapa-voxceleb) cosine to the target speaker
+WER/CER : CORPUS values -- pooled edits over pooled words/characters, so no std applies
+SIM / DNSMOS / UTMOS : per-utterance mean +- population standard deviation
+
+Reference points (unprocessed audio):
+   Floor   (pathological input) : WER 0.314   CER 0.202   DNSMOS 1.96+-0.42   UTMOS 1.40+-0.13
+   Ceiling (healthy target)     : WER 0.029   CER 0.011   DNSMOS 2.49+-0.55   UTMOS 3.52+-0.30
+
+
+----------------------------------------------------------------------------------------------
+TABLE 1   Modality and duration mode
+----------------------------------------------------------------------------------------------
+Input  Duration            WER    CER  SIM           DNSMOS        UTMOS        
+----------------------------------------------------------------------------------------------
+AV     predicted         0.180  0.088  0.64+-0.18    2.80+-0.40    3.33+-0.31   
+AV     teacher forced    0.232  0.148  0.66+-0.15    2.81+-0.46    2.90+-0.41   
+A      predicted         0.228  0.121  0.63+-0.17    2.80+-0.41    3.31+-0.34   
+A      teacher forced    0.317  0.193  0.65+-0.15    2.80+-0.46    2.90+-0.44   
+
+   AV = audio-visual input.  A = audio-only (the video stream is masked).
+   predicted      = the duration predictor sets the output length.
+   teacher forced = output length is forced to the INPUT length (no target leakage).
+
+
+----------------------------------------------------------------------------------------------
+TABLE 2   Noise robustness -- AUDIO-VISUAL
+----------------------------------------------------------------------------------------------
+Condition     SNR  noise/sig    WER    CER  SIM           DNSMOS        UTMOS        
+----------------------------------------------------------------------------------------------
+clean          --         --  0.180  0.088  0.64+-0.18    2.80+-0.40    3.33+-0.31   
++15 dB        +15       3.2%  0.213  0.110  0.64+-0.18    2.78+-0.41    3.32+-0.31   
++10 dB        +10      10.0%  0.228  0.115  0.63+-0.18    2.77+-0.41    3.31+-0.32   
++5 dB          +5      31.6%  0.279  0.147  0.63+-0.18    2.74+-0.41    3.29+-0.32   
+0 dB           +0     100.0%  0.427  0.233  0.63+-0.18    2.72+-0.39    3.24+-0.33   
+-5 dB          -5     316.2%  0.644  0.378  0.61+-0.17    2.68+-0.37    3.15+-0.35   
+
+   Babble noise mixed into the INPUT audio only; the target stays clean.
+   Duration predicted (dp). Noise seed 1234 -> both modalities get identical noise.
+   noise/sig = noise POWER as a percentage of signal power = 10^(-SNR/10).
+
+
+----------------------------------------------------------------------------------------------
+TABLE 3   Noise robustness -- AUDIO-ONLY
+----------------------------------------------------------------------------------------------
+Condition     SNR  noise/sig    WER    CER  SIM           DNSMOS        UTMOS        
+----------------------------------------------------------------------------------------------
+clean          --         --  0.228  0.121  0.63+-0.17    2.80+-0.41    3.31+-0.34   
++15 dB        +15       3.2%  0.304  0.177  0.62+-0.18    2.78+-0.40    3.29+-0.36   
++10 dB        +10      10.0%  0.343  0.207  0.62+-0.18    2.74+-0.41    3.26+-0.38   
++5 dB          +5      31.6%  0.455  0.281  0.61+-0.18    2.71+-0.42    3.19+-0.45   
+0 dB           +0     100.0%  0.978  0.685  0.58+-0.19    2.63+-0.42    3.05+-0.55   
+-5 dB          -5     316.2%  1.883  1.428  0.51+-0.18    2.43+-0.42    2.63+-0.63   
+
+   Babble noise mixed into the INPUT audio only; the target stays clean.
+   Duration predicted (dp). Noise seed 1234 -> both modalities get identical noise.
+   noise/sig = noise POWER as a percentage of signal power = 10^(-SNR/10).
+
+==============================================================================================

@@ -7,3 +7,5 @@ outputs/
 exp/
 manifest/pretrained_models/
 scripts/musica_submit_finetune.sh
+*.safetensors
+manifest/germanManifest/trainAugmented.tsv

@@ -198,6 +198,8 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         noise_wav: Optional[str] = None,
         noise_prob: float = 0.0,
         snr_levels: Optional[List[int]] = None,
+        eval_noise: bool = False,
+        noise_seed: Optional[int] = None,
     ):
         super().__init__()
         self.modalities = set(modalities) if modalities is not None else {"audio", "video"}
@@ -240,6 +242,13 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         # so the model learns to reconstruct clean speech from degraded audio (+video).
         self.noise_prob = float(noise_prob)
         self.snr_levels = list(snr_levels) if snr_levels is not None else [-10, -5, 0, 5, 10]
+        # eval_noise: opt-in flag set ONLY by the eval pipeline (dump_mels_eval) so that
+        # noise can be injected on a non-'train' subset (e.g. 'valid') for noisy-input
+        # robustness eval. Training/validation never pass it -> defaults False -> the
+        # injection gate below is unchanged (train-only), so training behavior is identical.
+        # noise_seed: when set, makes eval noise deterministic (seeded per utterance index).
+        self.eval_noise = bool(eval_noise)
+        self.noise_seed = noise_seed
         self.noise = None
         if noise_wav and self.noise_prob > 0.0:
             n_sr, n_wav = wavfile.read(noise_wav)
@@ -299,17 +308,26 @@ class mms_pathological_finetune_dataset(FairseqDataset):
             wav_data, sampling_rate=sample_rate, return_tensors="pt"
         ).input_features
 
-    def add_noise(self, wav: np.ndarray) -> np.ndarray:
-        """Mix babble noise into a 1-D float32 waveform at a random SNR."""
+    def add_noise(self, wav: np.ndarray, index: Optional[int] = None) -> np.ndarray:
+        """Mix babble noise into a 1-D float32 waveform at an SNR from self.snr_levels.
+        If self.noise_seed is set, the noise segment offset and SNR choice are seeded
+        per utterance `index` -> deterministic, reproducible noisy inputs (eval sweeps).
+        Training passes no seed -> behavior identical to before (module-level random)."""
         speech = torch.from_numpy(wav).unsqueeze(0)  # (1, T)
         T = speech.shape[1]
         noise = self.noise
         if noise.shape[1] < T:                       # tile if the clip is longer than the noise
             reps = T // noise.shape[1] + 1
             noise = noise.repeat(1, reps)
-        start = random.randint(0, noise.shape[1] - T)
+        if getattr(self, "noise_seed", None) is not None:
+            rng = random.Random(int(self.noise_seed) + int(index or 0))
+            start = rng.randint(0, noise.shape[1] - T)
+            snr_val = rng.choice(self.snr_levels)
+        else:
+            start = random.randint(0, noise.shape[1] - T)
+            snr_val = random.choice(self.snr_levels)
         noise_seg = noise[:, start:start + T]
-        snr = torch.tensor([random.choice(self.snr_levels)], dtype=torch.float32)
+        snr = torch.tensor([snr_val], dtype=torch.float32)
         noisy = torchaudio.functional.add_noise(speech, noise_seg, snr)
         return noisy.squeeze(0).numpy().astype(np.float32)
 
@@ -329,13 +347,20 @@ class mms_pathological_finetune_dataset(FairseqDataset):
         # slots so the model receives it whichever forward path it uses.
         patho_path = self.patho_paths[entry_idx]
         patho_wav, sr = self._load_wav(patho_path)
-        # Train-only noise injection on the INPUT audio (target stays clean).
+        # Noise injection on the INPUT audio (target stays clean). Applies on the 'train'
+        # subset (training, unchanged) OR when eval_noise is set (eval pipeline only).
         # getattr guards make this robust if a dataset object was constructed by an
         # older __init__ that predates the noise attributes (e.g. a live job whose
         # workers re-import this file mid-run) — it simply skips injection.
-        if (getattr(self, "noise", None) is not None and self.subset_name == "train"
-                and np.random.rand() < getattr(self, "noise_prob", 0.0)):
-            patho_wav = self.add_noise(patho_wav)
+        if (getattr(self, "noise", None) is not None
+                and (self.subset_name == "train" or getattr(self, "eval_noise", False))):
+            prob = getattr(self, "noise_prob", 0.0)
+            if getattr(self, "noise_seed", None) is not None:   # deterministic decision (eval)
+                draw = random.Random(int(self.noise_seed) + 10_000_000 + int(index)).random()
+            else:
+                draw = np.random.rand()
+            if draw < prob:
+                patho_wav = self.add_noise(patho_wav, index=index)
         patho_len = int(len(patho_wav))
         patho_whisper = self._wav_to_whisper(patho_wav, sr)
 

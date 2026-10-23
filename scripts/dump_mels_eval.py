@@ -66,8 +66,12 @@ from src.dataset_pathological_finetune import mms_pathological_finetune_dataset
 logger = logging.getLogger("melvc-dump-eval")
 
 
-def build_clean_dataset(cfg_task, manifest_path):
-    """Manifest dataset, CLEAN input (no babble), healthy target only."""
+def build_clean_dataset(cfg_task, manifest_path, noise_wav=None, noise_prob=0.0,
+                        snr_levels=None, noise_seed=None):
+    """Manifest dataset, healthy target only. Input is CLEAN by default; if noise_wav +
+    noise_prob>0 are given, eval_noise=True turns ON noise injection on the INPUT audio
+    (subset stays 'valid' -- the only thing enabling noise is eval_noise). Target stays clean."""
+    eval_noise = bool(noise_wav) and noise_prob > 0.0
     return mms_pathological_finetune_dataset(
         manifest_path=manifest_path,
         sample_rate=cfg_task.sample_rate,
@@ -79,10 +83,13 @@ def build_clean_dataset(cfg_task, manifest_path):
         image_crop_size=cfg_task.image_crop_size,
         image_aug=False,
         modalities=cfg_task.modalities,
-        subset_name="valid",        # noise gate CLOSED
+        subset_name="valid",        # NOT 'train'; noise is gated by eval_noise below
         number_of_synths=0,         # only the real target
-        noise_wav=None,
-        noise_prob=0.0,
+        noise_wav=noise_wav,
+        noise_prob=noise_prob,
+        snr_levels=snr_levels,
+        eval_noise=eval_noise,      # the ONLY switch that lets 'valid' inject noise
+        noise_seed=noise_seed,
     )
 
 
@@ -202,7 +209,22 @@ def main():
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--device", default=None)
     ap.add_argument("--overwrite", action="store_true")
+    # --- optional noisy-input eval: inject babble noise on the INPUT audio (target clean) ---
+    ap.add_argument("--noise-wav", default=None,
+                    help="16 kHz noise wav. With --noise-prob>0 this turns ON eval noise "
+                         "injection on the input (subset stays 'valid'; target stays clean).")
+    ap.add_argument("--noise-prob", type=float, default=0.0,
+                    help="Per-utterance probability of injecting noise (1.0 = every input).")
+    ap.add_argument("--snr", default=None,
+                    help="SNR(s) in dB: single value (e.g. '0') or comma list (e.g. '-10,-5,0'). "
+                         "A random one is chosen per noisy utterance.")
+    ap.add_argument("--noise-seed", type=int, default=None,
+                    help="Seed for reproducible eval noise (offset + SNR per utterance index).")
     args = ap.parse_args()
+
+    snr_levels = None
+    if args.snr is not None:
+        snr_levels = [int(float(x)) for x in str(args.snr).split(",") if x.strip() != ""]
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
@@ -233,7 +255,9 @@ def main():
         modalities = [m for m in dict.fromkeys(modalities)
                       if m in ("av", "video_only", "audio_only")]
 
-        ds = build_clean_dataset(task.cfg, args.manifest)
+        ds = build_clean_dataset(task.cfg, args.manifest,
+                                 noise_wav=args.noise_wav, noise_prob=args.noise_prob,
+                                 snr_levels=snr_levels, noise_seed=args.noise_seed)
         for mode in modes:                          # combinatorial: mode x modality
             for modality in modalities:
                 if modality == "audio_only":

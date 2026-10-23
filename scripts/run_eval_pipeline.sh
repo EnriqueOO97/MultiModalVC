@@ -16,7 +16,7 @@
 #SBATCH --mem=64G
 #SBATCH -p zen4_0768_h100x4
 #SBATCH --qos zen4_0768_h100x4
-#SBATCH --time=12:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=/tmp/melvc_eval_pipe_%j.log
 #SBATCH --error=/tmp/melvc_eval_pipe_%j.log
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -38,7 +38,7 @@ BATCH_SIZE=${BATCH_SIZE:-32}
 SCORE_BATCH_SIZE=${SCORE_BATCH_SIZE:-48}
 OW_FLAG=""; [ "${OVERWRITE:-}" = "true" ] && OW_FLAG="--overwrite"
 
-echo "[eval-pipe] stage=$STAGE batch=$BATCH_SIZE score_batch=$SCORE_BATCH_SIZE out_root=${OUT_ROOT:-<default>} modality=${MODALITY:-<default>}"
+echo "[eval-pipe] stage=$STAGE batch=$BATCH_SIZE score_batch=$SCORE_BATCH_SIZE out_root=${OUT_ROOT:-<default>} modality=${MODALITY:-<default>} mode=${MODE:-dp} asr=${ASR_MODEL:-openai/whisper-large-v3} noise_wav=${NOISE_WAV:-<none>} noise_prob=${NOISE_PROB:-0} snr=${SNR:-<none>}"
 python scripts/run_eval_pipeline.py --stage "$STAGE" --batch-size "$BATCH_SIZE" \
     --score-batch-size "$SCORE_BATCH_SIZE" $OW_FLAG
 

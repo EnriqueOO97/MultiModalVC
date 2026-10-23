@@ -170,6 +170,16 @@ def score_and_write(uids, paths, refs, model, processor, device, args, out_path)
     corpus_w = jiwer.wer([r if r else " " for r in ref_n], [h if h else " " for h in hyp_n])
     corpus_c = jiwer.cer([r if r else " " for r in ref_n], [h if h else " " for h in hyp_n])
 
+    if getattr(args, "dump_hyps", False):
+        # Raw Whisper text next to the scores (uid / ref / hyp) so failure modes can be
+        # inspected (e.g. memorised training sentences). Off by default: no other change.
+        hyp_path = os.path.splitext(out_path)[0] + "_hyps.tsv"
+        with open(hyp_path, "w") as fh:
+            fh.write("uid\tref\thyp\n")
+            for uid, r, h in zip(uids, refs, hyps):
+                fh.write(f"{uid}\t{r.strip()}\t{h.strip()}\n")
+        logger.info(f"    -> {hyp_path}  (hypotheses dumped)")
+
     with open(out_path, "w") as fh:
         fh.write("uid\tWER\tCER\n")
         for uid, w, c in zip(uids, wers, cers):
@@ -232,6 +242,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--device", default=None)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--dump-hyps", action="store_true",
+                    help="Also write <out>_hyps.tsv (uid, ref, raw Whisper hyp) for inspection.")
     args = ap.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
